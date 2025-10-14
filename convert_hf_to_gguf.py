@@ -9221,30 +9221,44 @@ class KimiVLModel(MmprojModel):
 
 @ModelBase.register("Glm4vMoeForConditionalGeneration")
 class GLM4V_MoE(MmprojModel):
-    #
-    # the HF model's type is `glm4v_moe`. internally, it consists of two models:
-    # - `glm4v_moe_text`
-    # + main text model
-    # + tensor names start with "model.language_model."
-    # + "2D-RoPE" (aKa Roformer) w/ embeddings dynamically adapted via bicubic interpolation
-    # - `glm4v_moe`
-    # + vision adapter (ViT)
-    # + tensor names start with "model.visual."
-    # + "3D-RoPE" (without the interpolation mentioned above)
-    #
-    # other notable quirks include:
-    # - has MTP layer (need to keep these tensors - same as GLM-4.5-Air)
-    # - RoPE theta value (θ): use 10k rather than 100k for GLM-4.5-Air
-    # - the model's vision supports video input, but this is not implemented here
-    #
-    # for more info, refer to:
-    # - reference impl          : https://github.com/huggingface/transformers/tree/main/src/transformers/models/glm4v_moe
-    # - HF model card           : https://huggingface.co/zai-org/GLM-4.5V
-    # - arXiv paper (model)     : https://arxiv.org/abs/2507.01006
-    # - arXiv paper (orig. ViT) : https://arxiv.org/abs/2411.14402
-    #
-    # TODO: the model's tokenizer has video-related special tokens - deal with these (??)
-    #
+    """The HF architecture is called **`Glm4vMoeForConditionalGeneration`** (`"model_type": "glm4v_moe"`). Internally, this consists of an LLM (text model) and a ViT (vision adapter / multimodal projector):
+
+    ### LLM (text model `glm4v_moe_text`)
+    - Based on GLM-4.5-Air
+    - Tensor names start with `model.language_model.`
+    - Uses a "multimodal 3D RoPE" - in `apply_multimodal_rotary_pos_emb`, it applies rotary embeddings across temporal, height, and width dimensions for visual tokens
+
+    ### ViT (vision adapter `glm4v_moe`)
+    - Adapted from [apple/aimv2-huge-patch14-336](https://huggingface.co/apple/aimv2-huge-patch14-336):
+        + Architecture **`Aimv2VisionModel`**
+        + ~681M params
+        + 24 layers
+        + hidden_size (n_embd): 1536
+        + intermediate_size (n_ff): 4096
+        + image_size: 336
+        + patch_size: 14
+        + num_channels: 3
+        + depth: 24
+    - Tensor names start with `model.visual.`
+    - Its 2D positional embeddings are dynamically adapted via bicubic interpolation within the `Glm4vMoeVisionEmbeddings` module to handle varied image resolutions
+    - It also applies its own rotary position embeddings within the self-attention blocks (via `apply_rotary_pos_emb_vision`)
+
+    ## Other notes:
+    - Native context length is `65_536` (as opposed to `131_072` for GLM-4.5-Air)
+    - RoPE theta (θ): `10_000.0` (as opposed to `100_000.0` for GLM-4.5-Air)
+    - The model supports video input, but I currently do not plan to support video input in this PR
+    - Tokenizer has video-related special tokens - need to handle these during conversion
+
+    ### References:
+    - The HF reference implementations:
+        + [modeling_glm4v_moe.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4v_moe/modeling_glm4v_moe.py)
+        + [modular_glm4v_moe.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4v_moe/modular_glm4v_moe.py)
+    - The HF [model card](https://huggingface.co/zai-org/GLM-4.5V)
+    - The HF [config.json](https://huggingface.co/zai-org/GLM-4.5V/blob/main/config.json)
+
+    ### See also:
+    - [arXiv:2507.01006](https://arxiv.org/abs/2507.01006)
+    - [arXiv:2411.14402](https://arxiv.org/abs/2411.14402)"""
     pass
 
 

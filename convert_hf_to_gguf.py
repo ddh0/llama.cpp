@@ -9246,7 +9246,7 @@ class GLM4V_MoE(MmprojModel):
     ## Other notes:
     - Native context length is `65_536` (as opposed to `131_072` for GLM-4.5-Air)
     - RoPE theta (θ): `10_000.0` (as opposed to `100_000.0` for GLM-4.5-Air)
-    - The model supports video input, but I currently do not plan to support video input in this PR
+    - The model supports video input, but this is not yet implemented (only images)
     - Tokenizer has video-related special tokens - need to handle these during conversion
 
     ### References:

@@ -1,7 +1,7 @@
-#include "llama-quant.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
+#include "llama-quant.h"
 
 #include <cmath>
 #include <mutex>
@@ -13,37 +13,6 @@
 #include <cinttypes>
 #include <unordered_map>
 #include <condition_variable>
-
-// Quantization types. Changes to this struct must be replicated in quantize.cpp
-struct tensor_quantization {
-    std::string name;
-    ggml_type quant = GGML_TYPE_COUNT;
-};
-
-// tensor categorization (used to avoid repeated string matching)
-enum class tensor_category {
-    TOKEN_EMBD,
-    ATTENTION_Q,
-    ATTENTION_V,
-    ATTENTION_K,
-    ATTENTION_QKV,
-    ATTENTION_KV_B,
-    ATTENTION_OUTPUT,
-    FFN_UP,
-    FFN_GATE,
-    FFN_DOWN,
-    OUTPUT,
-    OTHER
-};
-
-// cached metadata per tensor
-struct tensor_metadata {
-    tensor_category category;
-    ggml_type target_type;
-    std::string remapped_imatrix_name;
-    bool allows_quantization;
-    bool requires_imatrix;
-};
 
 // threads are spawned once and reused for all work, avoiding overhead
 struct quantize_thread_pool {
@@ -801,9 +770,7 @@ static ggml_type llama_tensor_get_type(
                       const ggml_type   default_type,
                 const tensor_metadata & tm)
 {
-    if (!tm.allows_quantization) {
-        return tensor->type;
-    }
+    // NOTE: you are supposed to check if this tensor allows quantization BEFORE you enter this function
 
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
         return params->token_embedding_type;
@@ -1030,6 +997,7 @@ static size_t tensor_dequant_and_quantize_fused_impl(
     const int64_t ne1 = tensor->ne[1]; // n_rows
     const int64_t ne2 = tensor->ne[2]; // n_expert (or any 3rd tensor dimension)
     const int64_t ne0_x_1 = ne0 * ne1;
+    tensor->nb
 
     const size_t src_blk_size  = ggml_blck_size(src_type);
     const size_t src_blk_bytes = ggml_type_size(src_type);

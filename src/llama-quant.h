@@ -1,7 +1,5 @@
 #pragma once
-// #include <string>
-// #include <stdint.h>
-// #include "ggml.h"
+#include <string>
 
 // store result of parsing --tensor-type option
 struct tensor_type_option {

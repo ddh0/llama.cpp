@@ -63,18 +63,18 @@ struct scheduler {
     // per-tensor metadata for all tensors in the model
     std::vector<tensor_sched_data> data_vec;
 
-    size_t largest_tensor_size_src = 0; // size of largest tensor to be quantized (as src type)
-    size_t largest_tensor_size_f32 = 0; // size of largest tensor to be quantized (as f32)
-    size_t largest_tensor_size_dst = 0; // size of largest tensor to be quantized (as dst type)
+    size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type)
+    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as f32)
+    size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type)
 
     //
     // scheduling pipeline buffers (one of each at most)
     //
 
-    // size: largest_tensor_size_src
+    // size: max_tensor_size_src
     std::vector<uint8_t> buf_read; // don't need this if using mmap?
 
-    // size: largest_tensor_size_f32
+    // size: max_tensor_size_f32
     std::vector<float> buf_dequant; // dequantization buffer
 
     // size: largest_tensor_size_dst
@@ -89,13 +89,13 @@ struct scheduler {
     scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _data_vec):
         n_threads(_n_threads), data_vec(_data_vec), pool(_n_threads)
     {
-        for (int32_t idx = 0; idx < data_vec.size(); idx++) {
-        /*
-            TODO: set these:
-            largest_tensor_size         = ...;
-            largest_tensor_size_dequant = ...;
-            largest_tensor_size_quant   = ...;
-        */
+        GGML_ASSERT(GGML_MAX_DIMS == 4 && "GGML_MAX_DIMS is not 4 - update this function");
+        for (int32_t idx = 0; idx < data_vec.size(); ++idx) {
+            const auto & data = data_vec[idx];
+            const int64_t nrows = data.ne1 * data.ne2 * data.ne3;
+            max_src_sz = std::max(max_src_sz, nrows * ggml_row_size(data.src_type, data.ne0));
+            max_f32_sz = std::max(max_f32_sz, nrows * ggml_row_size(GGML_TYPE_F32, data.ne0));
+            max_dst_sz = std::max(max_dst_sz, nrows * ggml_row_size(data.dst_type, data.ne0));
         }
 
         // TODO: allocate pipeline buffers

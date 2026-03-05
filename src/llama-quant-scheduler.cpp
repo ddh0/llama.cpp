@@ -1,6 +1,7 @@
 /**
  *
- * Whenever possible, we aim to overlap computation and tensor data disk I/O.
+ * Whenever possible, we aim to overlap computation and tensor data disk I/O in the quantization
+ * process.
  *
  * This is the primary bottleneck in very many cases, and currently it's not handled very
  * efficiently - computation never overlaps with I/O on `master` at the time of writing. Rather,
@@ -35,7 +36,8 @@ struct compute_pool {
     std::atomic_flag busy;
 
     compute_pool(const int32_t _n_threads):
-        n_threads(_n_threads), threads(_n_threads) {
+        n_threads(_n_threads), threads(_n_threads)
+    {
         // TODO: prepare the threads? but don't start them.
         // TODO: init `busy` atomic flag?
     };
@@ -59,7 +61,7 @@ struct scheduler {
     const int32_t n_threads;
 
     // per-tensor metadata for all tensors in the model
-    std::vector<tensor_sched_data> tschd_vec;
+    std::vector<tensor_sched_data> data_vec;
 
     size_t largest_tensor_size_src = 0; // size of largest tensor to be quantized (as src type)
     size_t largest_tensor_size_f32 = 0; // size of largest tensor to be quantized (as f32)
@@ -84,10 +86,10 @@ struct scheduler {
     compute_pool pool;
 
     // initialize
-    scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _tschd_vec):
-        n_threads(_n_threads), tschd_vec(_tschd_vec), pool(_n_threads)
+    scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _data_vec):
+        n_threads(_n_threads), data_vec(_data_vec), pool(_n_threads)
     {
-        for (int32_t idx = 0; idx < tschd_vec.size(); idx++) {
+        for (int32_t idx = 0; idx < data_vec.size(); idx++) {
         /*
             TODO: set these:
             largest_tensor_size         = ...;
@@ -112,9 +114,5 @@ struct scheduler {
 
     void stop() {
         // TODO: graceful shutdown + deallocation of buffers
-    }
-
-    void submit_compute(tensor_sched_data & tschd) {
-        // TODO: 
     }
 };

@@ -167,9 +167,9 @@ struct quantize_state_impl {
     {
         // compile regex patterns once - they are expensive
         if (params->tensor_types) {
-            const auto & tensor_types = *static_cast<const std::vector<tensor_quantization> *>(params->tensor_types);
-            for (const auto & [tname, qtype] : tensor_types) {
-                tensor_type_patterns.emplace_back(std::regex(tname), qtype);
+            const auto & tensor_types = *static_cast<const std::vector<tensor_type_option> *>(params->tensor_types);
+            for (const auto & [name, type] : tensor_types) {
+                tensor_type_patterns.emplace_back(std::regex(name), type);
             }
         }
     }

@@ -404,7 +404,7 @@ static ggml_type parse_ggml_type(const char * arg) {
     return GGML_TYPE_COUNT;
 }
 
-static bool parse_tensor_type(const char * data, std::vector<tensor_quantization> & tensor_type) {
+static bool parse_tensor_type(const char * data, std::vector<tensor_type_option> & tensor_type) {
     const char * sep = strchr(data, '=');
     if (sep == nullptr) {
         printf("\n%s: malformed tensor type '%s'\n\n", __func__, data);
@@ -424,11 +424,11 @@ static bool parse_tensor_type(const char * data, std::vector<tensor_quantization
     std::string tn(data, tn_len);
     std::transform(tn.begin(), tn.end(), tn.begin(), tolower);
     sep++;
-    tensor_quantization tqz;
-    tqz.name = tn;
-    tqz.quant = parse_ggml_type(sep);
-    tensor_type.emplace_back(std::move(tqz));
-    if (tqz.quant == GGML_TYPE_COUNT) {
+    tensor_type_option type_opt;
+    type_opt.name = tn;
+    type_opt.type = parse_ggml_type(sep);
+    tensor_type.emplace_back(std::move(type_opt));
+    if (type_opt.type == GGML_TYPE_COUNT) {
         printf("\n%s: invalid quantization type '%s'\n\n", __func__, sep);
         return false;
     }
@@ -436,7 +436,7 @@ static bool parse_tensor_type(const char * data, std::vector<tensor_quantization
     return true;
 }
 
-static bool parse_tensor_type_file(const char * filename, std::vector<tensor_quantization> & tensor_type) {
+static bool parse_tensor_type_file(const char * filename, std::vector<tensor_type_option> & tensor_type) {
     std::ifstream file(filename);
     if (!file) {
         printf("\n%s: failed to open file '%s': %s\n\n", __func__, filename, std::strerror(errno));
@@ -490,7 +490,7 @@ int main(int argc, char ** argv) {
     std::string imatrix_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
-    std::vector<tensor_quantization> tensor_types;
+    std::vector<tensor_type_option> tensor_types;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {

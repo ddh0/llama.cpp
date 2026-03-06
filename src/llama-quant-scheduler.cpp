@@ -29,6 +29,14 @@
 #include <atomic>
 #include <mutex>
 
+static int get_split_dimension(const tensor_sched_data & tsd, const int32_t n_threads) {
+    if (tsd.ne0 % n_threads) return 0;
+    if (tsd.ne1 % n_threads) return 1;
+    if (tsd.ne2 % n_threads) return 2;
+    if (tsd.ne3 % n_threads) return 3;
+    return -1;
+}
+
 // pool of worker threads used for dequantization and quantization
 struct compute_pool {
     const int32_t n_threads;
@@ -63,9 +71,9 @@ struct scheduler {
     // per-tensor metadata for all tensors in the model
     std::vector<tensor_sched_data> data_vec;
 
-    size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type)
-    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as float32)
-    size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type)
+    size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type) in bytes
+    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as float32) in bytes
+    size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type) in bytes
 
     //
     // scheduler pipeline buffers (one of each at most)
@@ -93,7 +101,17 @@ struct scheduler {
             max_dst_sz = std::max(max_dst_sz, nrows * ggml_row_size(data.dst_type, data.ne0));
         }
 
-        // TODO: allocate pipeline buffers
+        LLAMA_LOG_DEBUG("%s:    allocating read buffer ... ", __func__);
+        buf_read.resize(max_src_sz);
+        LLAMA_LOG_DEBUG("%8.2f MiB\n", max_src_sz/1024.0/1024.0);
+
+        LLAMA_LOG_DEBUG("%s: allocating compute buffer ... ", __func__);
+        buf_compute.resize(max_f32_sz);
+        LLAMA_LOG_DEBUG("%8.2f MiB\n", max_f32_sz/1024.0/1024.0);
+
+        LLAMA_LOG_DEBUG("%s:   allocating write buffer ... ", __func__);
+        buf_write.resize(max_dst_sz);
+        LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
     };
 
     void start() {
@@ -104,7 +122,13 @@ struct scheduler {
     }
 
     void stop() {
-        // TODO: graceful shutdown + deallocation of buffers
+        LLAMA_LOG_DEBUG("%s: deallocating buffers ... ", __func__);
+
+        buf_read.clear();
+        buf_compute.clear();
+        buf_write.clear();
+
+        LLAMA_LOG_DEBUG("done\n");
     }
 
     ~scheduler() {

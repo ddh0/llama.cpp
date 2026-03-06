@@ -29,7 +29,7 @@
 #include <atomic>
 #include <mutex>
 
-// pool of compute worker threads
+// pool of worker threads used for dequantization and quantization
 struct compute_pool {
     const int32_t n_threads;
     std::vector<std::thread> threads;
@@ -43,18 +43,18 @@ struct compute_pool {
     };
 
     bool distribute(tensor_sched_data & data) {
-        // TODO: distribute 
+        // TODO: distribute
     };
 };
 
 //
 // quantization work scheduler
 //
-// goal: overlap I/O and computation as often as possible to speed-up the quantization process.
+// goal: overlap I/O and computation as much as possible to speed up the quantization process.
 //
 // the scheduler manages (`n_threads` + 2) threads:
 // - 1 thread for the `read_worker`
-// - `n_threads` threads for the `compute_pool` (tensor math is divided among compute workers)
+// - `n_threads` threads for the `compute_pool`
 // - 1 thread for the `write_worker`
 //
 struct scheduler {
@@ -64,28 +64,23 @@ struct scheduler {
     std::vector<tensor_sched_data> data_vec;
 
     size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type)
-    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as f32)
+    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as float32)
     size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type)
 
     //
-    // scheduling pipeline buffers (one of each at most)
+    // scheduler pipeline buffers (one of each at most)
     //
 
-    // size: max_tensor_size_src
-    std::vector<uint8_t> buf_read; // don't need this if using mmap?
-
-    // size: max_tensor_size_f32
-    std::vector<float> buf_dequant; // dequantization buffer
-
-    // size: largest_tensor_size_dst
-    std::vector<uint8_t> buf_quant; // quantization buffer (do we really need this?)
-
-    // size = largest tensor (as dst type)
-    std::vector<uint8_t> buf_write; // hold tensor data for writing (NOTE: tensors must be in order in the output file)
+    // size: max_src_sz
+    std::vector<uint8_t> buf_read;    // don't need this if using mmap?
+    // size: max_f32_sz
+    std::vector<float>   buf_compute; // dequant/quant buffer
+    // size = max_dst_sz
+    std::vector<uint8_t> buf_write;   // hold tensor data for writing (NOTE: tensors must be in order in the output file)
 
     compute_pool pool;
 
-    // initialize
+    // init
     scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _data_vec):
         n_threads(_n_threads), data_vec(_data_vec), pool(_n_threads)
     {
@@ -101,18 +96,18 @@ struct scheduler {
         // TODO: allocate pipeline buffers
     };
 
-    ~scheduler() {
-        stop();
-    }
-
     void start() {
         // TODO: start `read_worker` thread
         // TODO: THIS thread should manage the compute pool
         // TODO: start `write_worker` thread
-        // return void when done, throw std::runtime_error if something fails
+        // throw std::runtime_error if something fails
     }
 
     void stop() {
         // TODO: graceful shutdown + deallocation of buffers
+    }
+
+    ~scheduler() {
+        stop();
     }
 };

@@ -80,7 +80,7 @@ struct scheduler {
     //
 
     // size: max_src_sz
-    std::vector<uint8_t> buf_read;    // don't need this if using mmap?
+    std::vector<uint8_t> buf_read;    // hold tensor data for reading
     // size: max_f32_sz
     std::vector<float>   buf_compute; // dequant/quant buffer
     // size = max_dst_sz

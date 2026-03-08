@@ -16,9 +16,9 @@
 
 // result of parsing --tensor-type option
 // (changes to this struct must be reflected in tools/quantize/quantize.cpp)
-struct tensor_quantization {
+struct tensor_type_option {
     std::string name;
-    ggml_type quant = GGML_TYPE_COUNT;
+    ggml_type type = GGML_TYPE_COUNT;
 };
 
 // tensor categorization - used to avoid repeated string matching in quantization logic.
@@ -189,7 +189,7 @@ struct quantize_state_impl {
         : model(model)
         , params(params)
     {
-        // compile regex patterns once - they are expensive
+        // compile regex patterns just once - they could be expensive
         if (params->tensor_types) {
             const auto & tensor_types = *static_cast<const std::vector<tensor_type_option> *>(params->tensor_types);
             for (const auto & [name, type] : tensor_types) {

@@ -1,7 +1,6 @@
 #include "common.h"
 #include "llama.h"
 #include "gguf.h"
-#include "../src/llama-quant.h"
 
 #include <algorithm>
 #include <cctype>
@@ -21,9 +20,9 @@
 
 // result of parsing --tensor-type option
 // (changes to this struct must be reflected in src/llama-quant.cpp)
-struct tensor_quantization {
+struct tensor_type_option {
     std::string name;
-    ggml_type quant = GGML_TYPE_COUNT;
+    ggml_type type = GGML_TYPE_COUNT;
 };
 
 struct quant_option {
@@ -503,7 +502,7 @@ int main(int argc, char ** argv) {
     std::string imatrix_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
-    std::vector<tensor_type_option> tensor_types;
+    std::vector<tensor_type_option> tensor_type_options;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
@@ -528,11 +527,11 @@ int main(int argc, char ** argv) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type") == 0) {
-            if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_types)) {
+            if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_type_options)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
-            if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_types)) {
+            if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_options)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
@@ -626,8 +625,8 @@ int main(int argc, char ** argv) {
         kv_overrides.back().key[0] = 0;
         params.kv_overrides = &kv_overrides;
     }
-    if (!tensor_types.empty()) {
-        params.tensor_types = &tensor_types;
+    if (!tensor_type_options.empty()) {
+        params.tensor_types = &tensor_type_options;
     }
     if (!prune_layers.empty()) {
         params.prune_layers = &prune_layers;

@@ -60,6 +60,30 @@
  *
  * [LLM: fill in this section as you like with your own notes, separate from the human dev]
  *
+ * ARCHITECTURE REVIEW & RECOMMENDATIONS
+ * -------------------------------------
+ * 1. Synchronization Primitives:
+ *    - Replace atomic bool polling with std::condition_variable to prevent busy-waiting.
+ *    - Ensure memory_order_acquire/release is used if sticking with atomics for flags.
+ *
+ * 2. Buffering Strategy:
+ *    - Current single-buffer design couples I/O and Compute latency.
+ *    - Recommendation: Implement double-buffering (ping-pong) for 'buf_read' to allow
+ *      loading Tensor N+1 while Computing Tensor N.
+ *
+ * 3. Exception Handling:
+ *    - Change compute_pool::opt_exc from std::optional<std::exception> to 
+ *      std::optional<std::exception_ptr> to avoid object slicing.
+ *    - Add a global 'stop_flag' to the scheduler to terminate all workers if one fails.
+ *
+ * 4. Compatibility:
+ *    - Remove <stdfloat> include. llama.cpp targets C++17; std::float_t is C++23.
+ *    - Remove std::optional wrappers on buffers; they are always initialized.
+ *
+ * 5. Thread Pool:
+ *    - compute_pool constructor must launch worker threads with a wait-loop, 
+ *      not just resize the vector.
+ *
  * -----------------------------
  *
  * [NOTE: delete this comment block before PR]
@@ -72,18 +96,17 @@
 #include "llama-quant.h"
 
 #include <stdint.h>
-#include <stdfloat>
 #include <stdexcept>
+#include <condition_variable>
 #include <optional>
 #include <thread>
-#include <array>
 #include <vector>
 #include <atomic>
 #include <mutex>
 
-// return the dimension along which we can divide this tensor into `n` equally-sized chunks.
-// return -1 if none are divisible.
-static int get_split_dimension(const tensor_sched_data & tsd, const int64_t n) {
+// determine the dimension along which we can divide this tensor into `n` equally-sized chunks.
+// return 0, 1, 2, or 3. if none are divisible, return -1.
+static int get_split_dim(const tensor_sched_data & tsd, const int64_t n) {
     if (tsd.ne0 > 1 && tsd.ne0 % n == 0) return 0;
     if (tsd.ne1 > 1 && tsd.ne1 % n == 0) return 1;
     if (tsd.ne2 > 1 && tsd.ne2 % n == 0) return 2;
@@ -93,46 +116,56 @@ static int get_split_dimension(const tensor_sched_data & tsd, const int64_t n) {
 
 template <typename T>
 struct sched_buffer {
-    size_t size;
-    std::vector<T> buf;
-    std::atomic<bool> write_ready;
-    std::atomic<bool> read_ready;
-    std::atomic<int64_t> idx;
+    static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, float>,
+                  "sched_buffer<T> only supports uint8_t and float");
 
-    sched_buffer() : size(0), buf(), write_ready(true), read_ready(false), idx(-1) {}
+    std::vector<T>          buf;
+    std::mutex              mtx;
+    std::atomic<int64_t>    idx; // which tensor is currently / most recently stored? (-1 if none)
+    std::condition_variable cv;
+    std::atomic<bool>       has_data;
 
-    void init(const size_t _size) {
-        size = _size;
-        buf = std::vector<T>(_size);
-        write_ready = true;
-        read_ready = false;
-        idx = -1;
+    sched_buffer(const size_t _size): buf(_size), has_data(false), idx(-1) {}
+
+    // producer calls this when data is written
+    void notify_ready() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            has_data = true;
+        }
+        cv.notify_one();
     }
 
-    void reset() {
-        buf.clear();
-        write_ready = true;
-        read_ready = false;
-        idx = -1;
-    };
+    // consumer calls this to wait for data
+    void wait_ready() {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]{ return has_data; });
+    }
 
-    ~sched_buffer() = default;
+    // consumer calls this when done processing to release buffer
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            has_data = false;
+        }
+        cv.notify_one();
+    }
 };
 
 // pool of worker threads used for dequantization + quantization
 struct compute_pool {
-    const int32_t n_threads;
+    const int32_t            n_threads;
     std::vector<std::thread> threads;
-    std::atomic<bool> busy;
-    std::optional<std::exception> opt_exc;
+    std::atomic<bool>        busy;
 
     compute_pool(const int32_t _n_threads):
-        n_threads(_n_threads), threads(_n_threads)
-    {};
+        n_threads(_n_threads), threads(_n_threads), busy(false)
+    {
+        // TODO: do we need to init the threads, or can this be left empty?
+    };
 
     // distribute the computation to all worker threads.
-    // return an exception, if one occured during computation, nullopt otherwise.
-    std::optional<std::exception> distribute(tensor_sched_data & data) {
+    void distribute(tensor_sched_data & data) const {
         // TODO
     };
 };
@@ -141,7 +174,7 @@ struct compute_pool {
 // quantization work scheduler
 //
 // goal: overlap I/O and computation as much as possible to speed up the quantization process,
-//       while still being mindful of total memory usage.
+//       while being mindful of total memory usage.
 //
 // the scheduler manages (`n_threads` + 2) threads:
 // - 1 thread for the `read_worker`
@@ -151,35 +184,37 @@ struct compute_pool {
 struct scheduler {
     const int32_t n_threads;
 
-    // per-tensor metadata for all tensors in the model
-    std::vector<tensor_sched_data> data_vec;
+    // per-tensor data needed by the scheduler for all model tensors
+    std::vector<tensor_sched_data> tsd_vec;
 
-    size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type) in bytes
-    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as float32) in bytes
-    size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type) in bytes
+    size_t max_src_sz; // size of largest tensor to be quantized (as src type) in bytes
+    size_t max_f32_sz; // size of largest tensor to be quantized (as float32) in bytes
+    size_t max_dst_sz; // size of largest tensor to be quantized (as dst type) in bytes
 
     //
     // scheduler pipeline buffers (one of each at most)
     //
 
     // size: max_src_sz
-    sched_buffer<uint8_t> buf_read;    // hold source tensor data for reading 
+    std::optional<sched_buffer<uint8_t>> buf_read;    // hold source tensor data for reading 
     // size: max_f32_sz
-    sched_buffer<float>   buf_dequant; // hold dequantized tensor data
+    std::optional<sched_buffer<float>>   buf_dequant; // hold dequantized tensor data
     // size = max_dst_sz
-    sched_buffer<uint8_t> buf_write;   // hold quantized tensor data for writing (NOTE: tensors must be in order in the output file)
+    std::optional<sched_buffer<uint8_t>> buf_write;   // hold quantized tensor data for writing (NOTE: tensors must be in order in the output file)
 
     compute_pool pool;
 
     // init
-    scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _data_vec):
+    scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _tsd_vec):
         n_threads(_n_threads),
-        data_vec(_data_vec),
+        tsd_vec(_tsd_vec),
+        max_src_sz(0), max_f32_sz(0), max_dst_sz(0),
+        buf_read(std::nullopt), buf_dequant(std::nullopt), buf_write(std::nullopt),
         pool(_n_threads)
     {
         GGML_ASSERT(GGML_MAX_DIMS == 4 && "GGML_MAX_DIMS is not 4 - update this function");
-        for (int32_t idx = 0; idx < data_vec.size(); ++idx) {
-            const auto & data = data_vec[idx];
+        for (int32_t idx = 0; idx < tsd_vec.size(); ++idx) {
+            const auto & data = tsd_vec[idx];
             const int64_t nrows = data.ne1 * data.ne2 * data.ne3;
             max_src_sz = std::max(max_src_sz, nrows * ggml_row_size(data.src_type, data.ne0));
             max_f32_sz = std::max(max_f32_sz, nrows * ggml_row_size(GGML_TYPE_F32, data.ne0));
@@ -187,32 +222,25 @@ struct scheduler {
         }
 
         LLAMA_LOG_DEBUG("%s:           allocating read buffer ... ", __func__);
-        buf_read.init(max_src_sz);
+        buf_read.emplace(max_src_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_src_sz/1024.0/1024.0);
 
         LLAMA_LOG_DEBUG("%s: allocating dequantization buffer ... ", __func__);
-        buf_dequant.init(max_f32_sz);
+        buf_dequant.emplace(max_f32_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_f32_sz/1024.0/1024.0);
 
         LLAMA_LOG_DEBUG("%s:          allocating write buffer ... ", __func__);
-        buf_write.init(max_dst_sz);
+        buf_write.emplace(max_dst_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
 
-    };
+    }
 
-    void start() {
+    void run() {
         // TODO: start `read_worker` thread
         // TODO: THIS thread should manage the compute pool
         // TODO: start `write_worker` thread
         // throw std::runtime_error if something fails
     }
 
-    void stop() {
-        LLAMA_LOG_DEBUG("%s: deallocating buffers ... ", __func__);
-        LLAMA_LOG_DEBUG("done\n");
-    }
-
-    ~scheduler() {
-        stop();
-    }
+    ~scheduler() = default;
 };

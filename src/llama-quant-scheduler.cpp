@@ -91,40 +91,47 @@ static int get_split_dimension(const tensor_sched_data & tsd, const int64_t n) {
     return -1;
 }
 
-template <typename T> struct sched_buffer {
-    const size_t         size;                // number of T items that the buffer can hold
-    std::vector<T>       buf;                 // the buffer
-    std::atomic<bool>    write_ready = true;  // is this buffer ready to be written to?
-    std::atomic<bool>    read_ready  = false; // is this buffer ready to be read from?
-    std::atomic<int64_t> idx         = -1;    // which tensor is currently / most recently stored?
-    // init
-    sched_buffer(const size_t _size): size(_size), buf(_size) {};
-    // reset
+template <typename T>
+struct sched_buffer {
+    size_t size;
+    std::vector<T> buf;
+    std::atomic<bool> write_ready;
+    std::atomic<bool> read_ready;
+    std::atomic<int64_t> idx;
+
+    sched_buffer() : size(0), buf(), write_ready(true), read_ready(false), idx(-1) {}
+
+    void init(const size_t _size) {
+        size = _size;
+        buf = std::vector<T>(_size);
+        write_ready = true;
+        read_ready = false;
+        idx = -1;
+    }
+
     void reset() {
         buf.clear();
         write_ready = true;
         read_ready = false;
         idx = -1;
     };
-    // destruct
-    ~sched_buffer() {
-        buf.clear();
-        // TODO: is more needed here?
-    };
+
+    ~sched_buffer() = default;
 };
 
-// pool of worker threads used for dequantization and quantization
+// pool of worker threads used for dequantization + quantization
 struct compute_pool {
     const int32_t n_threads;
     std::vector<std::thread> threads;
     std::atomic<bool> busy;
+    std::optional<std::exception> opt_exc;
 
     compute_pool(const int32_t _n_threads):
         n_threads(_n_threads), threads(_n_threads)
     {};
 
-    // distribute the work for this tensor among the compute threads.
-    // return an exception, if one occured during computation.
+    // distribute the computation to all worker threads.
+    // return an exception, if one occured during computation, nullopt otherwise.
     std::optional<std::exception> distribute(tensor_sched_data & data) {
         // TODO
     };
@@ -133,7 +140,8 @@ struct compute_pool {
 //
 // quantization work scheduler
 //
-// goal: overlap I/O and computation as much as possible to speed up the quantization process.
+// goal: overlap I/O and computation as much as possible to speed up the quantization process,
+//       while still being mindful of total memory usage.
 //
 // the scheduler manages (`n_threads` + 2) threads:
 // - 1 thread for the `read_worker`
@@ -179,16 +187,17 @@ struct scheduler {
         }
 
         LLAMA_LOG_DEBUG("%s:           allocating read buffer ... ", __func__);
-        buf_read(max_src_sz);
+        buf_read.init(max_src_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_src_sz/1024.0/1024.0);
 
         LLAMA_LOG_DEBUG("%s: allocating dequantization buffer ... ", __func__);
-        buf_dequant(max_f32_sz);
+        buf_dequant.init(max_f32_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_f32_sz/1024.0/1024.0);
 
         LLAMA_LOG_DEBUG("%s:          allocating write buffer ... ", __func__);
-        buf_write(max_dst_sz);
+        buf_write.init(max_dst_sz);
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
+
     };
 
     void start() {
@@ -200,11 +209,6 @@ struct scheduler {
 
     void stop() {
         LLAMA_LOG_DEBUG("%s: deallocating buffers ... ", __func__);
-
-        buf_read.clear();
-        buf_dequant.clear();
-        buf_write.clear();
-
         LLAMA_LOG_DEBUG("done\n");
     }
 

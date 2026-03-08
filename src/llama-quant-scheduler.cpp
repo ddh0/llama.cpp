@@ -94,14 +94,15 @@
 #include "llama-model.h"
 #include "llama-quant.h"
 
-#include <stdint.h>
-#include <stdexcept>
-#include <condition_variable>
-#include <optional>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <atomic>
-#include <mutex>
+#include <stdint.h>
+#include <optional>
+#include <stdexcept>
+#include <type_traits>
+#include <condition_variable>
 
 // determine the dimension along which we can divide this tensor into `n` equally-sized chunks.
 // return 0, 1, 2, or 3. if none are divisible, return -1.

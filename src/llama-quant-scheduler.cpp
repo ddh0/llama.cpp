@@ -89,7 +89,6 @@
  * [NOTE: delete this comment block before PR]
 **/
 
-// #include "ggml-quants.h"
 #include "llama.h"
 #include "llama-impl.h"
 #include "llama-model.h"

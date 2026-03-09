@@ -60,30 +60,6 @@
  *
  * [LLM: fill in this section as you like with your own notes, separate from the human dev]
  *
- * ARCHITECTURE REVIEW & RECOMMENDATIONS
- * -------------------------------------
- * 1. Synchronization Primitives:
- *    - Replace atomic bool polling with std::condition_variable to prevent busy-waiting.
- *    - Ensure memory_order_acquire/release is used if sticking with atomics for flags.
- *
- * 2. Buffering Strategy:
- *    - Current single-buffer design couples I/O and Compute latency.
- *    - Recommendation: Implement double-buffering (ping-pong) for 'buf_read' to allow
- *      loading Tensor N+1 while Computing Tensor N.
- *
- * 3. Exception Handling:
- *    - Change compute_pool::opt_exc from std::optional<std::exception> to 
- *      std::optional<std::exception_ptr> to avoid object slicing.
- *    - Add a global 'stop_flag' to the scheduler to terminate all workers if one fails.
- *
- * 4. Compatibility:
- *    - Remove <stdfloat> include. llama.cpp targets C++17; std::float_t is C++23.
- *    - Remove std::optional wrappers on buffers; they are always initialized.
- *
- * 5. Thread Pool:
- *    - compute_pool constructor must launch worker threads with a wait-loop, 
- *      not just resize the vector.
- *
  * -----------------------------
  *
  * [NOTE: delete this comment block before PR]
@@ -91,7 +67,6 @@
 
 #include "llama.h"
 #include "llama-impl.h"
-#include "llama-model.h"
 #include "llama-quant.h"
 
 #include <mutex>
@@ -99,51 +74,60 @@
 #include <vector>
 #include <atomic>
 #include <stdint.h>
-#include <optional>
-#include <stdexcept>
 #include <type_traits>
 #include <condition_variable>
 
 // determine the dimension along which we can divide this tensor into `n` equally-sized chunks.
 // return 0, 1, 2, or 3. if none are divisible, return -1.
 static int get_split_dim(const tensor_sched_data & tsd, const int64_t n) {
-    if (tsd.ne0 > 1 && tsd.ne0 % n == 0) return 0;
-    if (tsd.ne1 > 1 && tsd.ne1 % n == 0) return 1;
-    if (tsd.ne2 > 1 && tsd.ne2 % n == 0) return 2;
-    if (tsd.ne3 > 1 && tsd.ne3 % n == 0) return 3;
+    if (tsd.ne0 > n && tsd.ne0 % n == 0) return 0;
+    if (tsd.ne1 > n && tsd.ne1 % n == 0) return 1;
+    if (tsd.ne2 > n && tsd.ne2 % n == 0) return 2;
+    if (tsd.ne3 > n && tsd.ne3 % n == 0) return 3;
     return -1;
 }
 
-template <typename T>
-struct sched_buffer {
+template <typename T> struct sched_buffer {
     static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, float>,
                   "sched_buffer<T> only supports uint8_t and float");
 
     std::vector<T>          buf;
     std::mutex              mtx;
-    std::atomic<int64_t>    idx; // which tensor is currently / most recently stored? (-1 if none)
-    std::condition_variable cv;
+    std::atomic<int64_t>    idx; // which tensor is currently or most recently stored? (-1 at init, then 0 for 1st tensor, 1 for 2nd tensor...)
     std::atomic<bool>       has_data;
+    std::condition_variable cv;
 
-    sched_buffer(const size_t _size): buf(_size), has_data(false), idx(-1) {}
+    // init but don't allocate the buffer yet
+    sched_buffer():
+        has_data(false), idx(-1)
+    {}
 
-    // producer calls this when data is written
-    void notify_ready() {
+    // allocate the buffer and return the allocated size in bytes
+    size_t allocate(const size_t _size) {
+        buf.resize(_size);
+        return sizeof(T) * _size;
+    }
+
+    // signal to workers that this buffer now has data for tensor at index `_idx`.
+    // this updates the buffer's `idx` to match. all indices must be sequential.
+    void signal_has_data(const int64_t _idx) {
         {
             std::lock_guard<std::mutex> lock(mtx);
+            GGML_ASSERT(_idx == idx + 1 && "buffer tensor indices must be sequential");
             has_data = true;
+            idx = _idx;
         }
         cv.notify_one();
     }
 
-    // consumer calls this to wait for data
-    void wait_ready() {
+    // workers call this function to wait for data in this buffer.
+    void wait_for_data() {
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock, [this]{ return has_data; });
     }
 
-    // consumer calls this when done processing to release buffer
-    void release() {
+    // signal to workers that this buffer should no longer be read from.
+    void signal_no_data() {
         {
             std::lock_guard<std::mutex> lock(mtx);
             has_data = false;
@@ -187,20 +171,24 @@ struct scheduler {
     // per-tensor data needed by the scheduler for all model tensors
     std::vector<tensor_sched_data> tsd_vec;
 
-    size_t max_src_sz; // size of largest tensor to be quantized (as src type) in bytes
-    size_t max_f32_sz; // size of largest tensor to be quantized (as float32) in bytes
-    size_t max_dst_sz; // size of largest tensor to be quantized (as dst type) in bytes
+    size_t max_src_sz = 0; // size of largest tensor to be quantized (as src type) in bytes
+    size_t max_f32_sz = 0; // size of largest tensor to be quantized (as float32) in bytes
+    size_t max_dst_sz = 0; // size of largest tensor to be quantized (as dst type) in bytes
 
     //
     // scheduler pipeline buffers (one of each at most)
     //
 
     // size: max_src_sz
-    std::optional<sched_buffer<uint8_t>> buf_read;    // hold source tensor data for reading 
+    sched_buffer<uint8_t> buf_read;        // tensor data is read into here as fast as possible (read worker keeps it full).
+    // size: max_src_sz
+    sched_buffer<uint8_t> buf_compute_src; // compute workers read src tensor data from here
     // size: max_f32_sz
-    std::optional<sched_buffer<float>>   buf_dequant; // hold dequantized tensor data
+    sched_buffer<float>   buf_compute_f32; // intermediate f32 tensor data (if necessary)
     // size = max_dst_sz
-    std::optional<sched_buffer<uint8_t>> buf_write;   // hold quantized tensor data for writing (NOTE: tensors must be in order in the output file)
+    sched_buffer<uint8_t> buf_compute_dst; // compute workers write dst tensor data into here
+    // size = max_dst_sz
+    sched_buffer<uint8_t> buf_write;       // tensor data is written to the output stream IN ORDER by the write worker.
 
     compute_pool pool;
 
@@ -208,36 +196,41 @@ struct scheduler {
     scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _tsd_vec):
         n_threads(_n_threads),
         tsd_vec(_tsd_vec),
-        max_src_sz(0), max_f32_sz(0), max_dst_sz(0),
-        buf_read(std::nullopt), buf_dequant(std::nullopt), buf_write(std::nullopt),
         pool(_n_threads)
     {
         GGML_ASSERT(GGML_MAX_DIMS == 4 && "GGML_MAX_DIMS is not 4 - update this function");
         for (int32_t idx = 0; idx < tsd_vec.size(); ++idx) {
             const auto & data = tsd_vec[idx];
-            const int64_t nrows = data.ne1 * data.ne2 * data.ne3;
+            const size_t nrows = data.ne1 * data.ne2 * data.ne3;
             max_src_sz = std::max(max_src_sz, nrows * ggml_row_size(data.src_type, data.ne0));
             max_f32_sz = std::max(max_f32_sz, nrows * ggml_row_size(GGML_TYPE_F32, data.ne0));
             max_dst_sz = std::max(max_dst_sz, nrows * ggml_row_size(data.dst_type, data.ne0));
         }
 
-        LLAMA_LOG_DEBUG("%s:           allocating read buffer ... ", __func__);
-        buf_read.emplace(max_src_sz);
+        LLAMA_LOG_DEBUG("%s:        allocating read buffer ... ", __func__);
+        GGML_ASSERT(max_src_sz == buf_read.allocate(max_src_sz)); 
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_src_sz/1024.0/1024.0);
 
-        LLAMA_LOG_DEBUG("%s: allocating dequantization buffer ... ", __func__);
-        buf_dequant.emplace(max_f32_sz);
+        LLAMA_LOG_DEBUG("%s: allocating compute src buffer ... ", __func__);
+        GGML_ASSERT(max_src_sz == buf_compute_src.allocate(max_src_sz)); 
+        LLAMA_LOG_DEBUG("%8.2f MiB\n", max_src_sz/1024.0/1024.0);
+
+        LLAMA_LOG_DEBUG("%s: allocating compute f32 buffer ... ", __func__);
+        GGML_ASSERT(max_f32_sz == buf_compute_f32.allocate(max_f32_sz / sizeof(float)));
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_f32_sz/1024.0/1024.0);
 
-        LLAMA_LOG_DEBUG("%s:          allocating write buffer ... ", __func__);
-        buf_write.emplace(max_dst_sz);
+        LLAMA_LOG_DEBUG("%s: allocating compute dst buffer ... ", __func__);
+        GGML_ASSERT(max_dst_sz == buf_compute_dst.allocate(max_dst_sz));
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
 
+        LLAMA_LOG_DEBUG("%s:       allocating write buffer ... ", __func__);
+        GGML_ASSERT(max_dst_sz == buf_write.allocate(max_dst_sz));
+        LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
     }
 
     void run() {
         // TODO: start `read_worker` thread
-        // TODO: THIS thread should manage the compute pool
+        // TODO: start `compute_worker` thread (?)
         // TODO: start `write_worker` thread
         // throw std::runtime_error if something fails
     }

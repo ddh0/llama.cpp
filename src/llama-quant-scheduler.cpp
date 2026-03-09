@@ -180,17 +180,21 @@ struct scheduler {
     //
 
     // size: max_src_sz
-    sched_buffer<uint8_t> buf_read;        // tensor data is read into here as fast as possible (read worker keeps it full).
+    sched_buffer<uint8_t> buf_read;        // tensor data is read into here as fast as possible by `reader_th`
     // size: max_src_sz
-    sched_buffer<uint8_t> buf_compute_src; // compute workers read src tensor data from here
+    sched_buffer<uint8_t> buf_compute_src; // compute pool reads src tensor data from here
     // size: max_f32_sz
     sched_buffer<float>   buf_compute_f32; // intermediate f32 tensor data (if necessary)
     // size = max_dst_sz
-    sched_buffer<uint8_t> buf_compute_dst; // compute workers write dst tensor data into here
+    sched_buffer<uint8_t> buf_compute_dst; // compute pool writes dst tensor data into here
     // size = max_dst_sz
-    sched_buffer<uint8_t> buf_write;       // tensor data is written to the output stream IN ORDER by the write worker.
+    sched_buffer<uint8_t> buf_write;       // tensor data is written from here to the output stream (IN ORDER) by `writer_th`
 
     compute_pool pool;
+
+    std::thread reader_th;  // constantly reading tensor data from the original model into buf_read.
+    std::thread compute_th; // manages compute_pool (exceptions, stopping, etc.)
+    std::thread writer_th;  // constantly writing tensor data from buf_write to the output stream IN ORDER.
 
     // init
     scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _tsd_vec):
@@ -229,9 +233,9 @@ struct scheduler {
     }
 
     void run() {
-        // TODO: start `read_worker` thread
-        // TODO: start `compute_worker` thread (?)
-        // TODO: start `write_worker` thread
+        // TODO: start `reader_th` thread
+        // TODO: start `compute_th` thread
+        // TODO: start `writer_th` thread
         // throw std::runtime_error if something fails
     }
 

@@ -256,12 +256,7 @@ struct scheduler {
         LLAMA_LOG_DEBUG("%8.2f MiB\n", max_dst_sz/1024.0/1024.0);
     }
 
-    void run() {
-        // TODO: start `reader_th` thread
-        // TODO: start `compute_th` thread
-        // TODO: start `writer_th` thread
-        // throw std::runtime_error if something fails
-    }
-
     ~scheduler() = default;
 };
+
+void scheduler::run() {};

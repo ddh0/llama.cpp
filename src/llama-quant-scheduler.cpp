@@ -77,16 +77,6 @@
 #include <type_traits>
 #include <condition_variable>
 
-// determine the dimension along which we can divide this tensor into `n` equally-sized chunks.
-// return 0, 1, 2, or 3. if none are divisible, return -1.
-static int get_split_dim(const tensor_sched_data & tsd, const int64_t n) {
-    if (tsd.ne0 > n && tsd.ne0 % n == 0) return 0;
-    if (tsd.ne1 > n && tsd.ne1 % n == 0) return 1;
-    if (tsd.ne2 > n && tsd.ne2 % n == 0) return 2;
-    if (tsd.ne3 > n && tsd.ne3 % n == 0) return 3;
-    return -1;
-}
-
 template <typename T> struct sched_buffer {
     static_assert(std::is_same_v<T, uint8_t> || std::is_same_v<T, float>,
                   "sched_buffer<T> only supports uint8_t and float");
@@ -98,9 +88,7 @@ template <typename T> struct sched_buffer {
     std::condition_variable cv;
 
     // init but don't allocate the buffer yet
-    sched_buffer():
-        has_data(false), idx(-1)
-    {}
+    sched_buffer(): has_data(false), idx(-1) {}
 
     // allocate the buffer and return the allocated size in bytes
     size_t allocate(const size_t _size) {
@@ -109,11 +97,11 @@ template <typename T> struct sched_buffer {
     }
 
     // signal to workers that this buffer now has data for tensor at index `_idx`.
-    // this updates the buffer's `idx` to match. all indices must be sequential.
+    // this updates the buffer's `idx` to match. indices must be sequential.
     void signal_has_data(const int64_t _idx) {
         {
             std::lock_guard<std::mutex> lock(mtx);
-            GGML_ASSERT(_idx == idx + 1 && "buffer tensor indices must be sequential");
+            GGML_ASSERT(_idx == idx + 1 && "tensor buffer indices must be sequential");
             has_data = true;
             idx = _idx;
         }
@@ -135,6 +123,42 @@ template <typename T> struct sched_buffer {
         cv.notify_one();
     }
 };
+
+struct read_worker {
+    std::thread thread;
+    const sched_buffer<uint8_t> & buf;
+
+    read_worker(const sched_buffer<uint8_t> & _buf): buf(_buf) {
+        // TODO: init?
+    };
+
+    ~read_worker() {
+        // TODO: safe stoppage + destruction of thread
+    }
+};
+
+struct write_worker {
+    std::thread thread;
+    const sched_buffer<uint8_t> & buf;
+
+    write_worker(const sched_buffer<uint8_t> & _buf): buf(_buf) {
+        // TODO: init?
+    };
+
+    ~write_worker() {
+        // TODO: safe stoppage + destruction of thread
+    }
+};
+
+// determine the dimension along which we can divide this tensor into `n` equally-sized chunks.
+// return 0, 1, 2, or 3. if none are divisible, return -1.
+static int get_split_dim(const std::vector<int64_t> & ne, const int64_t n) {
+    if (ne[0] > n && ne[0] % n == 0) return 0;
+    if (ne[1] > n && ne[1] % n == 0) return 1;
+    if (ne[2] > n && ne[2] % n == 0) return 2;
+    if (ne[3] > n && ne[3] % n == 0) return 3;
+    return -1;
+}
 
 // pool of worker threads used for dequantization + quantization
 struct compute_pool {
@@ -192,9 +216,9 @@ struct scheduler {
 
     compute_pool pool;
 
-    std::thread reader_th;  // constantly reading tensor data from the original model into buf_read.
-    std::thread compute_th; // manages compute_pool (exceptions, stopping, etc.)
-    std::thread writer_th;  // constantly writing tensor data from buf_write to the output stream IN ORDER.
+    // std::thread reader_th;  // constantly reading tensor data from the original model into buf_read.
+    // std::thread compute_th; // manages compute_pool (exceptions, stopping, etc.)
+    // std::thread writer_th;  // constantly writing tensor data from buf_write to the output stream IN ORDER.
 
     // init
     scheduler(const int32_t _n_threads, std::vector<tensor_sched_data> _tsd_vec):

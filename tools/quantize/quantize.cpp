@@ -434,11 +434,11 @@ static bool parse_tensor_type(const char * data, std::vector<tensor_type_option>
     std::string tn(data, tn_len);
     std::transform(tn.begin(), tn.end(), tn.begin(), tolower);
     sep++;
-    tensor_type_option type_opt;
-    type_opt.name = tn;
-    type_opt.type = parse_ggml_type(sep);
-    tensor_type.emplace_back(std::move(type_opt));
-    if (type_opt.type == GGML_TYPE_COUNT) {
+    tensor_type_option tensor_type_opt;
+    tensor_type_opt.name = tn;
+    tensor_type_opt.type = parse_ggml_type(sep);
+    tensor_type.emplace_back(std::move(tensor_type_opt));
+    if (tensor_type_opt.type == GGML_TYPE_COUNT) {
         printf("\n%s: invalid quantization type '%s'\n\n", __func__, sep);
         return false;
     }
@@ -502,7 +502,7 @@ int main(int argc, char ** argv) {
     std::string imatrix_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
-    std::vector<tensor_type_option> tensor_type_options;
+    std::vector<tensor_type_option> tensor_type_opts;
     std::vector<int> prune_layers;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
@@ -527,11 +527,11 @@ int main(int argc, char ** argv) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type") == 0) {
-            if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_type_options)) {
+            if (arg_idx == argc-1 || !parse_tensor_type(argv[++arg_idx], tensor_type_opts)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
-            if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_options)) {
+            if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_opts)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
@@ -625,8 +625,8 @@ int main(int argc, char ** argv) {
         kv_overrides.back().key[0] = 0;
         params.kv_overrides = &kv_overrides;
     }
-    if (!tensor_type_options.empty()) {
-        params.tensor_types = &tensor_type_options;
+    if (!tensor_type_opts.empty()) {
+        params.tensor_types = &tensor_type_opts;
     }
     if (!prune_layers.empty()) {
         params.prune_layers = &prune_layers;
@@ -742,4 +742,3 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
-

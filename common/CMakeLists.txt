@@ -63,6 +63,8 @@ add_library(${TARGET} STATIC
     debug.h
     download.cpp
     download.h
+    hf-cache.cpp
+    hf-cache.h
     http.h
     json-partial.cpp
     json-partial.h
@@ -81,6 +83,8 @@ add_library(${TARGET} STATIC
     preset.cpp
     preset.h
     regex-partial.cpp
+    reasoning-budget.cpp
+    reasoning-budget.h
     regex-partial.h
     sampling.cpp
     sampling.h

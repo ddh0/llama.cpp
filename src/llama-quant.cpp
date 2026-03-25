@@ -1,5 +1,4 @@
 #include "llama.h"
-#include "llama-quant.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
@@ -185,15 +184,14 @@ struct quantize_state_impl {
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
 
-    quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params)
-        : model(model)
-        , params(params)
+    quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
+        model(model), params(params)
     {
-        // compile regex patterns just once - they could be expensive
+        // compile regex patterns once - they are expensive
         if (params->tensor_types) {
             const auto & tensor_types = *static_cast<const std::vector<tensor_type_option> *>(params->tensor_types);
-            for (const auto & [name, type] : tensor_types) {
-                tensor_type_patterns.emplace_back(std::regex(name), type);
+            for (const auto & [tname, qtype] : tensor_types) {
+                tensor_type_patterns.emplace_back(std::regex(tname), qtype);
             }
         }
     }
@@ -677,7 +675,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
                 if (std::regex_search(tensor_name, pattern)) {
                     if (qtype != new_type) {
-                        LLAMA_LOG_WARN("(manual override: %s -> %s) ", ggml_type_name(new_type), ggml_type_name(qtype));
+                        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                                       __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
                         new_type = qtype;
                         manual = true;
                         break;
@@ -980,6 +979,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // compute tensor metadata once and cache it
     std::vector<tensor_metadata> metadata(tensors.size());
 
+    // initialize quantization state before preliminary loop (counters for use_more_bits)
+    {
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const auto cat = tensor_get_category(tensors[i]->tensor->name);
+            if (category_is_attn_v(cat)) {
+                ++qs.n_attention_wv;
+            }
+            if (cat == tensor_category::OUTPUT) {
+                qs.has_tied_embeddings = false;
+            }
+            metadata[i].category = cat; // save and re-use the category while we're at it
+        }
+        // these also need to be set to n_layer by default
+        qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer;
+    }
+
     // flag for --dry-run
     bool will_require_imatrix = false;
 
@@ -991,16 +1006,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const auto * it = tensors[i];
         const struct ggml_tensor * tensor = it->tensor;
         const std::string name = ggml_get_name(tensor);
-
-        metadata[i].category = tensor_get_category(name);
-
-        if (category_is_attn_v(metadata[i].category)) {
-            ++qs.n_attention_wv;
-        }
-
-        if (tensor_name_match_output_weight(name.c_str())) {
-            qs.has_tied_embeddings = false;
-        }
 
         uint16_t i_split = params->keep_split ? it->idx : 0;
         if (!ctx_outs[i_split]) {

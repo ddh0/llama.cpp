@@ -12,7 +12,7 @@
  *
  * For more information, see the README in this directory, as well as the Python script.
  *
- **/
+**/
 
 #include "llama.h"
 #include "common.h"

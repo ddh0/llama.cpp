@@ -1,5 +1,5 @@
-set(TARGET llama-tensor-capture-numpy)
-add_executable(${TARGET} tensor-capture-numpy.cpp)
+set(TARGET llama-tensor-diagnostics)
+add_executable(${TARGET} tensor-diagnostics.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 

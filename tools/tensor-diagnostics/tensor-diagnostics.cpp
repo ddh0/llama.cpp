@@ -1,5 +1,7 @@
 /**
  *
+ * llama-tensor-diagnostics
+ *
  * Capture intermediate tensors during graph execution and save them to disk in NumPy format.
  *
  * This tool is intended primarily for debugging busted models, but may also be useful for analysis

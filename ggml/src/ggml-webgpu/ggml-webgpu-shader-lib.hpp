@@ -26,20 +26,23 @@
 // Matrix multiplication parameters
 
 // Register tiling parameters
-#define WEBGPU_MUL_MAT_TILE_M    8
-#define WEBGPU_MUL_MAT_TILE_N    8
+#define WEBGPU_MUL_MAT_TILE_M    4
+#define WEBGPU_MUL_MAT_TILE_N    4
 #define WEBGPU_MUL_MAT_WG_SIZE_M 8
 #define WEBGPU_MUL_MAT_WG_SIZE_N 8
-#define WEBGPU_MUL_MAT_TILE_K    32
+#define WEBGPU_MUL_MAT_REG_TILE_K_FLOAT 8
+#define WEBGPU_MUL_MAT_REG_TILE_K_QUANT 32
 
 // Subgroup matrix parameters
 // The number of subgroups in the M dimension
 #define WEBGPU_MUL_MAT_SUBGROUP_M        2
 // The number of subgroups in the N dimension
-#define WEBGPU_MUL_MAT_SUBGROUP_N        2
+#define WEBGPU_MUL_MAT_SUBGROUP_N        4
 // The number of subgroup matrices each subgroup accumulates over
 #define WEBGPU_MUL_MAT_SUBGROUP_MATRIX_M 4
 #define WEBGPU_MUL_MAT_SUBGROUP_MATRIX_N 2
+#define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_FLOAT 32
+#define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT 32
 
 // Matrix-vector multiplication parameters
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
@@ -96,6 +99,29 @@ struct ggml_webgpu_processed_shader {
 struct ggml_webgpu_ssm_conv_shader_decisions {
     uint32_t block_size;
     uint32_t tokens_per_wg;
+};
+
+struct ggml_webgpu_ssm_scan_pipeline_key {
+    int type;
+    int d_state;
+
+    bool operator==(const ggml_webgpu_ssm_scan_pipeline_key & other) const {
+        return type == other.type && d_state == other.d_state;
+    }
+};
+
+struct ggml_webgpu_ssm_scan_pipeline_key_hash {
+    size_t operator()(const ggml_webgpu_ssm_scan_pipeline_key & key) const {
+        size_t seed = 0;
+        ggml_webgpu_hash_combine(seed, key.type);
+        ggml_webgpu_hash_combine(seed, key.d_state);
+        return seed;
+    }
+};
+
+struct ggml_webgpu_ssm_scan_shader_decisions {
+    uint32_t wg_size;
+    uint32_t tokens_per_tile;
 };
 
 /** Argsort **/
@@ -921,6 +947,8 @@ class ggml_webgpu_shader_lib {
         solve_tri_pipelines;  // type
     std::unordered_map<ggml_webgpu_ssm_conv_pipeline_key, webgpu_pipeline, ggml_webgpu_ssm_conv_pipeline_key_hash>
         ssm_conv_pipelines;   // type/vectorized
+    std::unordered_map<ggml_webgpu_ssm_scan_pipeline_key, webgpu_pipeline, ggml_webgpu_ssm_scan_pipeline_key_hash>
+        ssm_scan_pipelines;   // type/d_state
     std::unordered_map<ggml_webgpu_gated_delta_net_pipeline_key,
                        webgpu_pipeline,
                        ggml_webgpu_gated_delta_net_pipeline_key_hash>
@@ -1433,6 +1461,53 @@ class ggml_webgpu_shader_lib {
         return ssm_conv_pipelines[key];
     }
 
+    webgpu_pipeline get_ssm_scan_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        ggml_webgpu_ssm_scan_pipeline_key key = {};
+        key.type                              = context.dst->type;
+        key.d_state                           = (int) context.src0->ne[0];
+
+        auto it = ssm_scan_pipelines.find(key);
+        if (it != ssm_scan_pipelines.end()) {
+            return it->second;
+        }
+
+        std::vector<std::string> defines;
+        std::string              variant = "ssm_scan";
+
+        switch (key.type) {
+            case GGML_TYPE_F32:
+                variant += "_f32";
+                break;
+            default:
+                GGML_ABORT("Unsupported type for ssm_scan shader");
+        }
+
+        const uint32_t wg_size = (uint32_t) key.d_state;
+
+        constexpr uint32_t tokens_per_tile = 4u;
+
+        defines.push_back("WG_SIZE=" + std::to_string(wg_size) + "u");
+        defines.push_back("TOKENS_PER_TILE=" + std::to_string(tokens_per_tile) + "u");
+
+        if (context.supports_subgroups) {
+            defines.push_back("USE_SUBGROUP_REDUCTION");
+            variant += "_sg_reduce";
+        } else {
+            variant += "_wg_reduce";
+        }
+
+        variant += "_d" + std::to_string(key.d_state);
+
+        auto processed             = preprocessor.preprocess(wgsl_ssm_scan, defines);
+        auto decisions             = std::make_shared<ggml_webgpu_ssm_scan_shader_decisions>();
+        decisions->wg_size         = wg_size;
+        decisions->tokens_per_tile = tokens_per_tile;
+        webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context           = decisions;
+        ssm_scan_pipelines[key]    = pipeline;
+        return ssm_scan_pipelines[key];
+    }
+
     webgpu_pipeline get_gated_delta_net_pipeline(const ggml_webgpu_shader_lib_context & context) {
         ggml_webgpu_gated_delta_net_pipeline_key key = {};
         key.type                                     = context.dst->type;
@@ -1540,6 +1615,24 @@ class ggml_webgpu_shader_lib {
                     defines.push_back("MUL_ACC_" + type_upper);
                     defines.push_back("U32_DEQUANT_HELPERS");
                     defines.push_back("SRC0_INNER_TYPE=u32");
+                    switch (context.src0->type) {
+                        case GGML_TYPE_IQ1_S:
+                        case GGML_TYPE_IQ1_M:
+                        case GGML_TYPE_IQ2_S:
+                        case GGML_TYPE_IQ3_S:
+                        case GGML_TYPE_IQ4_NL:
+                        case GGML_TYPE_IQ4_XS:
+                            defines.push_back(type_upper + "_GRID");
+                            break;
+                        case GGML_TYPE_IQ2_XXS:
+                        case GGML_TYPE_IQ2_XS:
+                        case GGML_TYPE_IQ3_XXS:
+                            defines.push_back(type_upper + "_GRID");
+                            defines.push_back(type_upper + "_TABLES");
+                            break;
+                        default:
+                            break;
+                    }
                     break;
                 }
         }
@@ -1662,13 +1755,24 @@ class ggml_webgpu_shader_lib {
         // VEC/SCALAR controls
         defines.push_back(key.vectorized ? "VEC" : "SCALAR");
 
+        const bool is_quant = ggml_is_quantized(context.src0->type);
+
+        uint32_t tile_k;
+        if (key.use_subgroup_matrix) {
+            tile_k = is_quant ? WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT
+                              : WEBGPU_MUL_MAT_SUBGROUP_TILE_K_FLOAT;
+        } else {
+            tile_k = is_quant ? WEBGPU_MUL_MAT_REG_TILE_K_QUANT
+                              : WEBGPU_MUL_MAT_REG_TILE_K_FLOAT;
+        }
+
         // Tiles
         defines.push_back("TILE_M=" + std::to_string(WEBGPU_MUL_MAT_TILE_M) + "u");
         defines.push_back("TILE_N=" + std::to_string(WEBGPU_MUL_MAT_TILE_N) + "u");
-        defines.push_back("TILE_K=" + std::to_string(WEBGPU_MUL_MAT_TILE_K) + "u");
 
         // Subgroup matrix specifics
         if (key.use_subgroup_matrix) {
+            defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
             defines.push_back("MAX_SUBGROUP_SIZE=" + std::to_string(context.max_subgroup_size) + "u");
             defines.push_back("SUBGROUP_M=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_M) + "u");
             defines.push_back("SUBGROUP_N=" + std::to_string(WEBGPU_MUL_MAT_SUBGROUP_N) + "u");
@@ -1688,12 +1792,13 @@ class ggml_webgpu_shader_lib {
         if (!key.use_subgroup_matrix) {
             defines.push_back("WORKGROUP_SIZE_M=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_M) + "u");
             defines.push_back("WORKGROUP_SIZE_N=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
+            defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
         }
 
         auto processed = preprocessor.preprocess(shader_src, defines);
 
         auto decisions                 = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
-        decisions->tile_k              = WEBGPU_MUL_MAT_TILE_K;
+        decisions->tile_k              = tile_k;
         decisions->tile_m              = WEBGPU_MUL_MAT_TILE_M;
         decisions->tile_n              = WEBGPU_MUL_MAT_TILE_N;
         decisions->use_subgroup_matrix = key.use_subgroup_matrix;
@@ -1890,10 +1995,15 @@ class ggml_webgpu_shader_lib {
 
         defines.push_back("SCALAR");
 
+        // mul_mat_id is register-tile only.
+        const uint32_t tile_k = ggml_is_quantized(context.src0->type)
+                                    ? WEBGPU_MUL_MAT_REG_TILE_K_QUANT
+                                    : WEBGPU_MUL_MAT_REG_TILE_K_FLOAT;
+
         // Tiles
         defines.push_back("TILE_M=" + std::to_string(WEBGPU_MUL_MAT_TILE_M) + "u");
         defines.push_back("TILE_N=" + std::to_string(WEBGPU_MUL_MAT_TILE_N) + "u");
-        defines.push_back("TILE_K=" + std::to_string(WEBGPU_MUL_MAT_TILE_K) + "u");
+        defines.push_back("TILE_K=" + std::to_string(tile_k) + "u");
 
         defines.push_back("WORKGROUP_SIZE_M=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_M) + "u");
         defines.push_back("WORKGROUP_SIZE_N=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
@@ -1904,7 +2014,7 @@ class ggml_webgpu_shader_lib {
         auto processed = preprocessor.preprocess(wgsl_mul_mat_id, defines);
 
         auto decisions       = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
-        decisions->tile_k    = WEBGPU_MUL_MAT_TILE_K;
+        decisions->tile_k    = tile_k;
         decisions->tile_m    = WEBGPU_MUL_MAT_TILE_M;
         decisions->tile_n    = WEBGPU_MUL_MAT_TILE_N;
         decisions->wg_size_m = WEBGPU_MUL_MAT_WG_SIZE_M;

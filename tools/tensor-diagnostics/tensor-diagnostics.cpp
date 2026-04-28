@@ -19,7 +19,7 @@
  *
 **/
 
-#include "llama-impl.h" // needed for LLAMA_LOG_INFO etc.
+#include "log.h"
 #include "llama.h"
 #include "common.h"
 #include "arg.h"
@@ -77,16 +77,19 @@ static tensor_diagnostic_data process_tensor(const ggml_tensor * t) {
 // if the directory specified by `diag_output_dir` already exists, the program will abort to prevent
 // accidentally overwriting other diagnostic dumps.
 //
-static bool run_diagnostics(
+static void run_diagnostics(
     llama_context * ctx,
+    const common_params params,
     const std::filesystem::path text_input_file,
     const std::filesystem::path diag_output_dir,
     const int32_t n_pp_batches,
     const int32_t n_tg_batches
 ) {
-    LLAMA_LOG_INFO("running diagnostics ... this may take a while ...\n");
+    LOG_INF("%s: running diagnostics ... this may take a while ...\n", __func__);
 
-    LLAMA_LOG_INFO("running diagnostics ... this may take a while ...\n");
+    // ... TODO ...
+
+    LOG_INF("%s: done\n", __func__);
 }
 
 int main(int argc, char ** argv) {
@@ -106,25 +109,24 @@ int main(int argc, char ** argv) {
     params.cb_eval = tensor_diagnostic_cb;
     params.cb_eval_user_data = &cb_data;
 
+    LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+
     common_init_result_ptr common_init = common_init_from_params(params);
 
     llama_model * model = common_init->model(); GGML_ASSERT(model != nullptr);
     llama_context * ctx = common_init->context(); GGML_ASSERT(ctx != nullptr);
 
-    bool success;
-
-    {
-        success = run_diagnostics(
-            /* llama_context = */ ctx,
-            /* prompt_file   = */ std::filesystem::path(params.prompt_file), // --file or -f
-            /* output_dir    = */ std::filesystem::path("./diag-output/"), // TODO: make configurable
-            /* n_pp_batches  = */ int32_t(1), // TODO: make configurable
-            /* n_tg_batches  = */ int32_t(1)  // TODO: make configurable
-        );
-    }
+    run_diagnostics(
+        /* llama_context = */ ctx,
+        /* common_params = */ params,
+        /* prompt_file   = */ std::filesystem::path(params.prompt_file), // --file or -f
+        /* output_dir    = */ std::filesystem::path("./diag-output/"), // TODO: make configurable
+        /* n_pp_batches  = */ int32_t(1), // TODO: make configurable
+        /* n_tg_batches  = */ int32_t(1)  // TODO: make configurable
+    );
 
     llama_perf_context_print(ctx);
     llama_backend_free();
 
-    return (int)success;
+    return 0;
 }

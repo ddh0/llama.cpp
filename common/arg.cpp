@@ -3885,7 +3885,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
-        {"--data-output-dir"}, "PATH",
+        {"--output-dir"}, "PATH",
         string_format("llama-tensor-diagnostics: directory for saving numpy tensor data\n"
                       "(default: %s)", params.tensor_diag_output_dir.c_str()),
         [](common_params & params, const std::string & value) {

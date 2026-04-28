@@ -470,6 +470,9 @@ struct common_params {
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
 
+    // output directory, only used for llama-tensor-diagnoistic tool
+    std::string tensor_diag_output_dir = "./diag-output/";
+
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;

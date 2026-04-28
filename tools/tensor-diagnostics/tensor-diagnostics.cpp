@@ -2,20 +2,24 @@
  *
  * llama-tensor-diagnostics
  *
- * Capture all intermediate tensors during graph execution and save them to disk in NumPy format.
+ * This tool observes ALL intermediate tensors during graph execution, for a configurable number of
+ * prompt processing and text generation batches. It will display info about...
  *
- * This tool is intended primarily for debugging busted models, but may also be useful for analysis
- * of the hidden state `cur`, or any other node in the graph.
+ *   ... tensors with ANY non-finite elements
  *
- * The purpose of saving tensors in NumPy format rather than binary is to make debugging and
- * analysis easier - for example, we can capture multiple runs from different models and compare
- * them using a simple Python script. Once a tensor is saved to disk as a `.npy` file, then it
- * can be loaded directly as a NumPy array in any Python script using `np.load`.
+ *   ... tensors with ANY NaN elements
  *
- * For more information, see the README in this directory, as well as the Python script.
+ *   ... tensors whose elements are ALL zero (within tolerance [-0.005, 0.005] inclusive)
+ *
+ * All observed tensors will be captured, converted to the NumPy v1.0 format, and saved to disk.
+ *
+ * The resulting `.npy` tensor files can be loaded directly as a `np.ndarray` in Python using the 
+ * `np.load` function. From this point, in-depth post-mortem analysis of tensor data is hopefully
+ * much easier.
  *
 **/
 
+#include "llama-impl.h" // needed for LLAMA_LOG_INFO etc.
 #include "llama.h"
 #include "common.h"
 #include "arg.h"
@@ -23,22 +27,38 @@
 #include <filesystem>
 
 struct tensor_diagnostic_data {
-    const size_t num_zeros;
-    const size_t num_nans;
-    const size_t num_infs; // XXX: NaN vs. inf ??
+    size_t num_nans = 0;
+    size_t num_infs = 0;
+    bool   all_zero = true;
 };
 
+// callback function receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
-    // TODO: cast ggml_tensor * t to const inside this function - we cannot modify it
     if (ask) {
-        // the scheduler wants to know if we want to observe this tensor (we always do)
+        //
+        // before graph compute, the scheduler asks us if we want to observe each tensor.
+        // since this tool is primarily intended for diagnosing buggy or broken models (and not for
+        // general-purpose use by end-users), it is probably preferable to ALWAYS observe ALL
+        // tensors that we possibly can.
+        //
+        // in the future, we can almost certainly safely ignore certain types of tensors,
+        // particularly permutations and reshapings of tensors that we _did not_ ignore. currently,
+        // while this tool is under development, we will signal that we want to observe all tensors.
+        //
         return true;
     } else {
-        // the scheduler is passing the tensor to us for observation
-        const ggml_tensor & observed_tensor = *t;
-        // if we return false, the scheduler will cancel the graph computation
+        // we are in-flight; the scheduler is passing us the real tensor for observation.
+        //
+        // TODO: do stuff
+        //
+        return true; // if we return false, the scheduler aborts graph computation
     }
 };
+
+// process a single tensor and return diagnostic data
+static tensor_diagnostic_data process_tensor(const ggml_tensor * t) {
+    // TODO
+}
 
 //
 // main diagnostic operation:
@@ -58,12 +78,15 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
 // accidentally overwriting other diagnostic dumps.
 //
 static bool run_diagnostics(
+    llama_context * ctx,
     const std::filesystem::path text_input_file,
     const std::filesystem::path diag_output_dir,
-    const int64_t max_n_pp,
-    const int64_t max_n_tg)
-{
-    
+    const int32_t n_pp_batches,
+    const int32_t n_tg_batches
+) {
+    LLAMA_LOG_INFO("running diagnostics ... this may take a while ...\n");
+
+    LLAMA_LOG_INFO("running diagnostics ... this may take a while ...\n");
 }
 
 int main(int argc, char ** argv) {
@@ -83,16 +106,25 @@ int main(int argc, char ** argv) {
     params.cb_eval = tensor_diagnostic_cb;
     params.cb_eval_user_data = &cb_data;
 
-    auto common_init = common_init_from_params(params);
-    auto llama_model = common_init->model();
-    auto llama_ctx   = common_init->context();
+    common_init_result_ptr common_init = common_init_from_params(params);
+
+    llama_model * model = common_init->model(); GGML_ASSERT(model != nullptr);
+    llama_context * ctx = common_init->context(); GGML_ASSERT(ctx != nullptr);
+
+    bool success;
 
     {
-        res = run_diagnostics();
+        success = run_diagnostics(
+            /* llama_context = */ ctx,
+            /* prompt_file   = */ std::filesystem::path(params.prompt_file), // --file or -f
+            /* output_dir    = */ std::filesystem::path("./diag-output/"), // TODO: make configurable
+            /* n_pp_batches  = */ int32_t(1), // TODO: make configurable
+            /* n_tg_batches  = */ int32_t(1)  // TODO: make configurable
+        );
     }
 
-    llama_perf_context_print(llama_ctx);
+    llama_perf_context_print(ctx);
     llama_backend_free();
 
-    return 0;
+    return (int)success;
 }

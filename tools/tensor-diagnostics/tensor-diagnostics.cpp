@@ -92,7 +92,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_perf_context_print(llama_ctx);
-
     llama_backend_free();
 
     return 0;

@@ -42,7 +42,8 @@
 // elements with absolute values smaller than this are considered to be zero
 static constexpr float ZERO_TOLERANCE = 0.005;
 
-namespace numpy_utils {
+// utils for exporting GGML tensor data into NumPy v1.0 format
+namespace ggml_to_npy {
 
     // convert tensor name to safe file name ending in .npy
     // example: "__fattn__ (permuted)" --> "__fattn___(permuted).npy"
@@ -57,7 +58,7 @@ namespace numpy_utils {
     }
 
     // maps a GGML type to its corresponding NumPy data type descriptor string.
-    // NOTE: this tool exports bf16 tensors in f32 for compatability, so bf16 is not allowed here
+    // NOTE: this tool exports bf16 tensors in f32 for compatability, so bf16 is not allowed here.
     static std::string get_desc(ggml_type type) {
         switch (type) {
             case GGML_TYPE_F32:  return "'<f4'";
@@ -66,23 +67,33 @@ namespace numpy_utils {
             case GGML_TYPE_I32:  return "'<i4'";
             case GGML_TYPE_I16:  return "'<i2'";
             case GGML_TYPE_I8:   return "'<i1'";
-            case GGML_TYPE_BF16: GGML_ASSERT(false);
+            case GGML_TYPE_BF16:
+                throw std::runtime_error("bf16 numpy export is not supported, use f32");
             default: return "";
         }
     }
 
-    // write a minimal valid NumPy v1.0 header to a file
-    static void write_header(std::ofstream & out, const std::string & descr, const std::vector<int64_t> & shape) {
-        out.write("\x93NUMPY", 6); // magic bytes
+    // write a minimal valid NumPy v1.0 header to the given file stream
+    static void write_header(std::ofstream & out,
+        const std::string & descr,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3)
+    {
+        // valid tensors dims start at 1
+        GGML_ASSERT(ne0 > 0);
+        GGML_ASSERT(ne1 > 0);
+        GGML_ASSERT(ne2 > 0);
+        GGML_ASSERT(ne3 > 0);
+
+        out.write("\x93NUMPY", 6); // start header
         out << "\x01\x00\x00\x00"; // v1.0
 
         // header dictionary string
         std::string header = "{'descr': " + descr + ", 'fortran_order': False, 'shape': (";
-        for (size_t i = 0; i < shape.size(); ++i) {
-            header += std::to_string(shape[i]);
-            if (i < shape.size() - 1) header += ", ";
-        }
-        header += "), 'format': '<'}";
+        header += std::to_string(ne0) + ", " + std::to_string(ne1) + ", " +
+                  std::to_string(ne2) + ", " + std::to_string(ne3) + "), 'format': '<'}";
 
         // write header length (little endian)
         uint16_t header_len = static_cast<uint16_t>(header.length());
@@ -91,7 +102,8 @@ namespace numpy_utils {
         // write header string
         out.write(header.c_str(), header.length());
     }
-}
+
+} // ggml_to_npy
 
 struct all_stats {
     size_t n_zeros = 0;
@@ -148,7 +160,6 @@ static per_tensor_stats get_tensor_stats(const ggml_tensor * t) {
     return stats;
 }
 
-
 // callback function receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
     auto * session_stats = static_cast<all_stats *>(user_data);
@@ -199,7 +210,6 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
     }
 
     const auto n_batch = llama_n_batch(ctx);
-
     const bool add_bos = llama_vocab_get_add_bos(llama_model_get_vocab(llama_get_model(ctx)));
 
     // tokenize prompt
@@ -218,11 +228,12 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
 
     }
 
-    // truncate prompt to one full batch / pad with 0 for dummy tokens
+    // this truncates prompt to one full batch if too large, or pads with 0s if too small
     prompt_tokens.resize(n_batch);
     GGML_ASSERT(prompt_tokens.size() == n_batch && n_prompt_tokens == n_batch);
 
-    // XXX: only support one sequence for now, maybe more later
+    // note that we only fill and decode one sequence for now.
+    // in the future this can be configurable
     llama_batch batch = llama_batch_init(static_cast<int32_t>(n_batch), 0, 1);
     for (size_t i = 0; i < n_batch; ++i) {
         batch.token[i] = prompt_tokens[i];

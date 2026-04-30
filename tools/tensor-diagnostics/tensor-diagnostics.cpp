@@ -122,11 +122,11 @@ namespace ggml_to_npy {
 } // ggml_to_npy
 
 struct session_stats_t {
-    size_t n_total_bytes_observed = 0; // total amount of tensor data that is observed / captured
-    size_t n_nodes_observed       = 0;
-    size_t n_zero_tensors         = 0;
-    size_t n_nan_tensors          = 0;
-    size_t n_inf_tensors          = 0;
+    size_t n_capture = 0;              // incremented by 1 for every tensor that is observed by the callback
+    size_t n_total_bytes_captured = 0; // combined size of all tensor data observed
+    size_t n_zero_tensors = 0;         // total num. tensors observed whose elements were ALL zero
+    size_t n_nan_tensors = 0;          // total num. tensors observed with one or more NaN elements
+    size_t n_inf_tensors = 0;          // total num. tensors observed with one or more non-finite elements
 };
 
 struct tensor_stats_t {
@@ -140,38 +140,100 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     GGML_ASSERT(t != nullptr);
 
     tensor_stats_t stats;
-    int64_t n_elem = ggml_nelements(t);
 
-    if (n_elem == 0) {
+    auto n_elements = static_cast<size_t>(ggml_nelements(t));
+
+    if (n_elements == 0) {
         return stats;
     }
 
-    const uint8_t * data = (const uint8_t *)t->data;
-    size_t n_elements = static_cast<size_t>(n_elem);
-
     switch (t->type) {
         case GGML_TYPE_F32: {
-            const float * f32_data = (const float *)data;
+            const float * f32_data = (const float *)t->data;
             for (size_t i = 0; i < n_elements; ++i) {
-                float val = f32_data[i];
-                if (std::isnan(val)) stats.n_nans++;
-                if (std::isinf(val)) stats.n_infs++;
-                if (std::abs(val) <= ZERO_TOLERANCE) stats.n_zeros++;
+                float elem = f32_data[i];
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
             }
             break;
         }
         case GGML_TYPE_F16: {
-            const ggml_fp16_t * f16_data = (const ggml_fp16_t *)data;
+            const ggml_fp16_t * f16_data = (const ggml_fp16_t *)t->data;
             for (size_t i = 0; i < n_elements; ++i) {
-                float val = ggml_fp16_to_fp32(f16_data[i]);
-                if (std::isnan(val)) stats.n_nans++;
-                if (std::isinf(val)) stats.n_infs++;
-                if (std::abs(val) <= ZERO_TOLERANCE) stats.n_zeros++;
+                float elem = ggml_fp16_to_fp32(f16_data[i]);
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_BF16: {
+            const ggml_bf16_t * bf16_data = (const ggml_bf16_t *)t->data;
+            for (size_t i = 0; i < n_elements; ++i) {
+                float elem = ggml_bf16_to_fp32(bf16_data[i]);
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_I64: {
+            const int64_t * i64_data = (const int64_t *)t->data;
+            for (size_t i = 0; i < n_elements; ++i) {
+                int64_t elem = i64_data[i];
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_I32: {
+            const int32_t * i32_data = (const int32_t *)t->data;
+            for (size_t i = 0; i < n_elements; ++i) {
+                int32_t elem = i32_data[i];
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_I16: {
+            const int16_t * i16_data = (const int16_t *)t->data;
+            for (size_t i = 0; i < n_elements; ++i) {
+                int16_t elem = i16_data[i];
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_I8: {
+            const int8_t * i8_data = (const int8_t *)t->data;
+            for (size_t i = 0; i < n_elements; ++i) {
+                int8_t elem = i8_data[i];
+                if (std::isnan(elem)) stats.n_nans++;
+                if (std::isinf(elem)) stats.n_infs++;
+                if (std::abs(elem) <= ZERO_TOLERANCE) {
+                    stats.n_zeros++;
+                }
             }
             break;
         }
         default:
-            LLAMA_LOG_WARN("%s: tensor '%s' has unsupported type (%s)\n",
+            LLAMA_LOG_WARN("%s: tensor '%s' has unsupported type (%s) and will not be counted\n",
                            __func__, t->name, ggml_type_name(t->type));
             break;
     }
@@ -179,14 +241,14 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     return stats;
 }
 
-// callback function receives tensors from scheduler
+// callback function, receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
     session_stats_t * session_stats = static_cast<session_stats_t *>(user_data);
     if (ask) {
         //
         // before graph compute, the scheduler asks us if we want to observe each tensor.
         // since this tool is primarily intended for diagnosing buggy or broken models,
-        // rather than for actual inference, this tool will always observe all tensors.
+        // rather than for productive inference, this tool will always observe all tensors.
         //
         return true;
     } else {
@@ -200,7 +262,6 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
 
 // main diagnostic operation
 static void run_diagnostics(llama_context * ctx, const common_params params) {
-    LLAMA_LOG_INFO("%s: running diagnostics ... this may take a while ...\n", __func__);
 
     // ensure output directory exists
     if (!params.tensor_diag_output_dir.empty()) {
@@ -216,18 +277,14 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
                        "saved!\n", __func__);
     }
 
-    if (params.prompt.empty()) {
-        LLAMA_LOG_ERROR("%s: no prompt provided via -f / --file\n", __func__);
-        return;
-    }
-
     const auto n_batch = llama_n_batch(ctx);
     const bool add_bos = llama_vocab_get_add_bos(llama_model_get_vocab(llama_get_model(ctx)));
 
     // tokenize prompt
+    LLAMA_LOG_INFO("%s: tokenizing prompt ...\n", __func__);
     std::vector<llama_token> prompt_tokens = common_tokenize(ctx, params.prompt, add_bos, false);
-
     const auto n_prompt_tokens = prompt_tokens.size();
+    LLAMA_LOG_INFO("%s: n_prompt_tokens = %zu\n", __func__, n_prompt_tokens);
 
     if (n_prompt_tokens < n_batch) {
         LLAMA_LOG_WARN("%s: n_prompt_tokens %zu < n_batch %u; will pad with tok ID 0 "
@@ -249,12 +306,14 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
     }
     batch.n_tokens = n_batch;
 
-    int32_t res = llama_decode(ctx, batch);
-    if (res != 0) {
-        LLAMA_LOG_ERROR("%s: llama_decode failed with code %d\n", __func__, res);
+    LLAMA_LOG_INFO("%s: running diagnostics over %d tokens ... this may take a while ...\n",
+                   __func__, n_batch);
+    auto ret = llama_decode(ctx, batch);
+    if (ret != 0) {
+        LLAMA_LOG_ERROR("%s: llama_decode failed with code %d\n", __func__, ret);
     }
 
-    LLAMA_LOG_INFO("%s: done\n", __func__);
+    LLAMA_LOG_INFO("%s: done.\n", __func__);
 }
 
 int main(int argc, char ** argv) {
@@ -277,13 +336,18 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto session_stats = stats();
+    auto session_stats = session_stats_t();
 
     params.cb_eval = tensor_diagnostic_cb;
     params.cb_eval_user_data = &session_stats;
 
     LLAMA_LOG_INFO("%s\n", common_params_get_system_info(params).c_str());
     common_init_result_ptr common_init = common_init_from_params(params);
+
+    if (params.prompt.empty()) {
+        LLAMA_LOG_ERROR("%s: no prompt provided via -f / --file\n", __func__);
+        return 1;
+    }
 
     llama_model * model = common_init->model();
     GGML_ASSERT(model != nullptr);
@@ -292,6 +356,8 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(ctx != nullptr);
 
     run_diagnostics(ctx, params);
+
+    // TODO: session_report(session_stats);
 
     llama_perf_context_print(ctx);
 

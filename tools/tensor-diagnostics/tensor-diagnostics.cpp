@@ -1,6 +1,7 @@
 /**
  *
- * llama-tensor-diagnostics
+ * (name TBD): llama-tensor-diagnostics, llama-tensor-debug, llama-tensor-numerics,
+ *             llama-graph-node-report, ...
  *
  * This tool observes, prints info about, and exports to `.npy` ALL intermediate tensors (nodes)
  * during decoding (GGML compute graph execution). The model processes a single batch of tokens,
@@ -30,6 +31,8 @@
  *
 **/
 
+/* !! THIS FILE IS STILL UNDER ACTIVE DEVELOPMENT !! */
+
 #include "llama-impl.h" // needed for LLAMA_LOG_* and llama_format_tensor_shape
 #include "llama.h"
 #include "common.h"
@@ -50,7 +53,7 @@ static constexpr float ZERO_TOLERANCE = 0.005;
 namespace ggml_to_npy {
 
     // given a tensor name, return a file-safe name ending in .npy
-    std::string get_filename(const std::string & tensor_name) {
+    static std::string get_filename(const std::string & tensor_name) {
         std::string fname = tensor_name;
         for (char & c : fname) {
             if (std::string("/\\:*?\"<>| ").find(c) != std::string::npos) {
@@ -62,7 +65,7 @@ namespace ggml_to_npy {
 
     // given a GGML type, return the corresponding NumPy data type descriptor string
     // NOTE: this tool exports bf16 tensors in f32 for compatability, so bf16 is not allowed here.
-    std::string get_descr(ggml_type type) {
+    static std::string get_descr(ggml_type type) {
         switch (type) {
             case GGML_TYPE_F32:  return "'<f4'";
             case GGML_TYPE_F16:  return "'<f2'";
@@ -83,7 +86,7 @@ namespace ggml_to_npy {
 
     // write a minimal valid NumPy v1.0 header to the given file stream.
     // NOTE: the stream should be in binary mode.
-    void write_header(std::ofstream & out, const std::string & descr,
+    static void write_header(std::ofstream & out, const std::string & descr,
         const int64_t ne0,
         const int64_t ne1,
         const int64_t ne2,
@@ -95,16 +98,16 @@ namespace ggml_to_npy {
         GGML_ASSERT(ne2 > 0);
         GGML_ASSERT(ne3 > 0);
 
-        out << "\x93NUMPY\x01\x00"; // magic string, major version, minor version
+        out << "\x93NUMPY\x01\x00"; // magic string, major version, minor version (8 bytes total)
 
         // build header string
         std::string header = "{'descr': " + descr + ", 'fortran_order': False, 'shape': ("
-            + std::to_string(ne3) + ", "
-            + std::to_string(ne2) + ", "
-            + std::to_string(ne1) + ", "
-            + std::to_string(ne0) + ")}";
+            + std::to_string(ne3) + ", "  //
+            + std::to_string(ne2) + ", "  // note the reversed ordering of tensor dimensions
+            + std::to_string(ne1) + ", "  // between GGML and NumPy!
+            + std::to_string(ne0) + ")}"; //
 
-        // write header length and contents
+        // write header length (2 bytes) and contents (`header_len` bytes)
         const uint16_t header_len = static_cast<uint16_t>(header.length());
         out << reinterpret_cast<const char *>(&header_len) << header.c_str();
 
@@ -118,23 +121,25 @@ namespace ggml_to_npy {
 
 } // ggml_to_npy
 
-struct all_stats {
-    size_t n_zeros = 0;
-    size_t n_nans  = 0;
-    size_t n_infs  = 0;
+struct session_stats_t {
+    size_t n_total_bytes_observed = 0; // total amount of tensor data that is observed / captured
+    size_t n_nodes_observed       = 0;
+    size_t n_zero_tensors         = 0;
+    size_t n_nan_tensors          = 0;
+    size_t n_inf_tensors          = 0;
 };
 
-struct per_tensor_stats {
+struct tensor_stats_t {
     size_t n_zeros = 0;
     size_t n_nans  = 0;
     size_t n_infs  = 0;
 };
 
 // process a single tensor and return stats
-static per_tensor_stats get_tensor_stats(const ggml_tensor * t) {
+static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     GGML_ASSERT(t != nullptr);
 
-    per_tensor_stats stats;
+    tensor_stats_t stats;
     int64_t n_elem = ggml_nelements(t);
 
     if (n_elem == 0) {
@@ -176,31 +181,24 @@ static per_tensor_stats get_tensor_stats(const ggml_tensor * t) {
 
 // callback function receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
-    auto * session_stats = static_cast<all_stats *>(user_data);
+    session_stats_t * session_stats = static_cast<session_stats_t *>(user_data);
     if (ask) {
         //
         // before graph compute, the scheduler asks us if we want to observe each tensor.
-        // since this tool is primarily intended for diagnosing buggy or broken models, rather than
-        // for actual inference, it is probably preferable to ALWAYS observe ALL tensors that we
-        // possibly can.
-        //
-        // in the future, we can almost certainly safely ignore certain types of tensors,
-        // particularly permutations and reshapings of tensors that we _did not_ ignore. currently,
-        // while this tool is under development, we will signal that we want to observe all tensors.
+        // since this tool is primarily intended for diagnosing buggy or broken models,
+        // rather than for actual inference, this tool will always observe all tensors.
         //
         return true;
     } else {
-        per_tensor_stats t_stats = get_tensor_stats(t);
-        session_stats->n_zeros += t_stats.n_zeros;
-        session_stats->n_nans  += t_stats.n_nans;
-        session_stats->n_infs  += t_stats.n_infs;
+        tensor_stats_t tensor_stats = get_tensor_stats(t);
+        //
+        // TODO
+        //
         return true;
     }
 }
 
-//
 // main diagnostic operation
-//
 static void run_diagnostics(llama_context * ctx, const common_params params) {
     LLAMA_LOG_INFO("%s: running diagnostics ... this may take a while ...\n", __func__);
 
@@ -214,8 +212,8 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
             }
         }
     } else {
-        LLAMA_LOG_WARN("%s: `--output-dir` parameter is not set; observed tensors will not be saved!\n",
-                       __func__);
+        LLAMA_LOG_WARN("%s: `--output-dir` parameter is not set; observed tensors will not be "
+                       "saved!\n", __func__);
     }
 
     if (params.prompt.empty()) {
@@ -231,17 +229,11 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
 
     const auto n_prompt_tokens = prompt_tokens.size();
 
-    if (n_prompt_tokens == 0) {
-        LLAMA_LOG_ERROR("%s: no tokens in prompt; cannot proceed\n", __func__);
-        return;
-    }
     if (n_prompt_tokens < n_batch) {
         LLAMA_LOG_WARN("%s: n_prompt_tokens %zu < n_batch %u; will pad with tok ID 0 "
                        "(this is most likely not a problem)\n", __func__, n_prompt_tokens, n_batch);
-
     }
 
-    // this truncates prompt to one full batch if too large, or pads with 0s if too small
     prompt_tokens.resize(n_batch);
     GGML_ASSERT(prompt_tokens.size() == n_batch);
 
@@ -275,18 +267,20 @@ int main(int argc, char ** argv) {
     }
 
     // enforce some basic parameters for now; maybe improve flexibility later
-    params.n_ubatch = params.n_batch;
-    params.n_ctx = params.n_batch;
-    params.warmup = false;
+    const int32_t n_batch = std::max(params.n_ubatch, params.n_batch);
+    params.n_ubatch   = n_batch;
+    params.n_batch    = n_batch;
+    params.n_ctx      = n_batch;
+    params.warmup     = false;
     params.n_parallel = 1;
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto cb_data = all_stats();
+    auto session_stats = stats();
 
     params.cb_eval = tensor_diagnostic_cb;
-    params.cb_eval_user_data = &cb_data;
+    params.cb_eval_user_data = &session_stats;
 
     LLAMA_LOG_INFO("%s\n", common_params_get_system_info(params).c_str());
     common_init_result_ptr common_init = common_init_from_params(params);

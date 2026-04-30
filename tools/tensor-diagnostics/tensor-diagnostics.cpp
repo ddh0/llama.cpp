@@ -3,7 +3,7 @@
  * llama-tensor-diagnostics
  *
  * This tool observes, prints info about, and exports to `.npy` ALL intermediate tensors (nodes)
- * during decoding (GGML compute graph execution). The model processes a single batch of plaintext,
+ * during decoding (GGML compute graph execution). The model processes a single batch of tokens,
  * which is read from the plaintext file specified by `-f` or `--file`.
  *
  * For every tensor observed, the tool will print the tensor name, shape, GGML_TYPE, etc.
@@ -37,29 +37,32 @@
 
 #include <cmath>
 #include <fstream>
+#include <stdexcept>
 #include <filesystem>
+
 
 // elements with absolute values smaller than this are considered to be zero
 static constexpr float ZERO_TOLERANCE = 0.005;
 
-// utils for exporting GGML tensor data into NumPy v1.0 format
+
+// utils for exporting GGML tensors as NumPy `.npy` files
+// ref: https://numpy.org/doc/1.26/reference/generated/numpy.lib.format.html#format-version-1-0
 namespace ggml_to_npy {
 
-    // convert tensor name to safe file name ending in .npy
-    // example: "__fattn__ (permuted)" --> "__fattn___(permuted).npy"
-    static std::string get_filename(const std::string & name) {
-        std::string sanitized = name;
-        for (char & c : sanitized) {
+    // given a tensor name, return a file-safe name ending in .npy
+    std::string get_filename(const std::string & tensor_name) {
+        std::string fname = tensor_name;
+        for (char & c : fname) {
             if (std::string("/\\:*?\"<>| ").find(c) != std::string::npos) {
                 c = '_';
             }
         }
-        return sanitized + ".npy";
+        return fname + ".npy";
     }
 
-    // maps a GGML type to its corresponding NumPy data type descriptor string.
+    // given a GGML type, return the corresponding NumPy data type descriptor string
     // NOTE: this tool exports bf16 tensors in f32 for compatability, so bf16 is not allowed here.
-    static std::string get_desc(ggml_type type) {
+    std::string get_descr(ggml_type type) {
         switch (type) {
             case GGML_TYPE_F32:  return "'<f4'";
             case GGML_TYPE_F16:  return "'<f2'";
@@ -68,39 +71,49 @@ namespace ggml_to_npy {
             case GGML_TYPE_I16:  return "'<i2'";
             case GGML_TYPE_I8:   return "'<i1'";
             case GGML_TYPE_BF16:
-                throw std::runtime_error("bf16 numpy export is not supported, use f32");
-            default: return "";
+                throw std::runtime_error("BF16 is not currently supported for NumPy export "
+                                         "(use f32 instead)");
+            default:
+                throw std::runtime_error(format(
+                    "GGML type %s is not currently supported for NumPy export",
+                    ggml_type_name(type)
+                ));
         }
     }
 
-    // write a minimal valid NumPy v1.0 header to the given file stream
-    static void write_header(std::ofstream & out,
-        const std::string & descr,
+    // write a minimal valid NumPy v1.0 header to the given file stream.
+    // NOTE: the stream should be in binary mode.
+    void write_header(std::ofstream & out, const std::string & descr,
         const int64_t ne0,
         const int64_t ne1,
         const int64_t ne2,
         const int64_t ne3)
     {
-        // valid tensors dims start at 1
+        // valid GGML tensor dims start at 1 (i.e. the smallest valid shape is [1, 1, 1, 1])
         GGML_ASSERT(ne0 > 0);
         GGML_ASSERT(ne1 > 0);
         GGML_ASSERT(ne2 > 0);
         GGML_ASSERT(ne3 > 0);
 
-        out.write("\x93NUMPY", 6); // start header
-        out << "\x01\x00\x00\x00"; // v1.0
+        out << "\x93NUMPY\x01\x00"; // magic string, major version, minor version
 
-        // header dictionary string
-        std::string header = "{'descr': " + descr + ", 'fortran_order': False, 'shape': (";
-        header += std::to_string(ne0) + ", " + std::to_string(ne1) + ", " +
-                  std::to_string(ne2) + ", " + std::to_string(ne3) + "), 'format': '<'}";
+        // build header string
+        std::string header = "{'descr': " + descr + ", 'fortran_order': False, 'shape': ("
+            + std::to_string(ne3) + ", "
+            + std::to_string(ne2) + ", "
+            + std::to_string(ne1) + ", "
+            + std::to_string(ne0) + ")}";
 
-        // write header length (little endian)
-        uint16_t header_len = static_cast<uint16_t>(header.length());
-        out.write(reinterpret_cast<const char *>(&header_len), sizeof(header_len));
+        // write header length and contents
+        const uint16_t header_len = static_cast<uint16_t>(header.length());
+        out << reinterpret_cast<const char *>(&header_len) << header.c_str();
 
-        // write header string
-        out.write(header.c_str(), header.length());
+        const size_t n_bytes = 10 + header_len;
+        const size_t n_pad = (64 - (n_bytes % 64)) % 64;
+
+        if (n_pad > 0) {
+            out << std::string(n_pad, ' ');
+        }
     }
 
 } // ggml_to_npy
@@ -153,7 +166,8 @@ static per_tensor_stats get_tensor_stats(const ggml_tensor * t) {
             break;
         }
         default:
-            LLAMA_LOG_WARN("%s: unsupported type\n", __func__);
+            LLAMA_LOG_WARN("%s: tensor '%s' has unsupported type (%s)\n",
+                           __func__, t->name, ggml_type_name(t->type));
             break;
     }
 
@@ -213,8 +227,7 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
     const bool add_bos = llama_vocab_get_add_bos(llama_model_get_vocab(llama_get_model(ctx)));
 
     // tokenize prompt
-    std::vector<llama_token> prompt_tokens =
-        common_tokenize(ctx, params.prompt, add_bos, /* parse_special = */ false);
+    std::vector<llama_token> prompt_tokens = common_tokenize(ctx, params.prompt, add_bos, false);
 
     const auto n_prompt_tokens = prompt_tokens.size();
 
@@ -230,7 +243,7 @@ static void run_diagnostics(llama_context * ctx, const common_params params) {
 
     // this truncates prompt to one full batch if too large, or pads with 0s if too small
     prompt_tokens.resize(n_batch);
-    GGML_ASSERT(prompt_tokens.size() == n_batch && n_prompt_tokens == n_batch);
+    GGML_ASSERT(prompt_tokens.size() == n_batch);
 
     // note that we only fill and decode one sequence for now.
     // in the future this can be configurable

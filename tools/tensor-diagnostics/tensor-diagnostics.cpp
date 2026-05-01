@@ -32,7 +32,7 @@
 
 /* !! THIS FILE IS STILL UNDER ACTIVE DEVELOPMENT !! */
 
-#include "llama-impl.h" // needed for LLAMA_LOG_* and llama_format_tensor_shape
+#include "llama-impl.h" // needed for LLAMA_LOG_*
 #include "llama.h"
 #include "common.h"
 #include "arg.h"
@@ -142,11 +142,8 @@ static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, ggml_ten
         GGML_ASSERT(t->ne[1] > 0);
         GGML_ASSERT(t->ne[2] > 0);
         GGML_ASSERT(t->ne[3] > 0);
-
-        LLAMA_LOG_INFO("%s: %05zu: %-64s - [ %6lld, %6lld, %6lld, %6lld ], n_elements = %lld\n",
-                       __func__, session_stats->n_capture, t->name,
-                       t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_elements);
     } else {
+        // sometimes there are zero-element tensors, we will ignore those except to count them
         ++session_stats->n_zero_sized_tensors;
         return stats; // return stats of all 0s
     }
@@ -265,7 +262,7 @@ static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, ggml_ten
             break;
         }
         default:
-            LLAMA_LOG_WARN("%s: tensor '%s' has unsupported type (%s) and will not be counted\n",
+            LLAMA_LOG_WARN("%s: tensor '%s' has unsupported type (%s), will not be counted\n",
                            __func__, t->name, ggml_type_name(t->type));
             break;
     }
@@ -298,10 +295,13 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         return true;
     } else {
         const auto t_stats = get_tensor_stats(session_stats, t);
-        // const auto t_fname = ggml_to_npy::get_filename(t->name);
-        //
-        // TODO
-        //
+
+        // TODO: improve logging to show the stats we care about in real time
+        LLAMA_LOG_INFO("%s: %05zu: %-64s - [ %6lld, %6lld, %6lld, %6lld ], n_elements = %lld\n",
+                __func__, session_stats->n_capture, t->name,
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_nelements(t));
+
+        // TODO: write captured tensor data to disk
         return true;
     }
 }

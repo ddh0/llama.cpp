@@ -1,10 +1,10 @@
 /**
  *
- * (name TBD): llama-tensor-diagnostics, llama-tensor-debug, llama-tensor-numerics ... ?
+ * llama-tensor-diagnostics
  *
  * This tool observes, prints info about, and exports to `.npy` ALL intermediate tensors (nodes)
- * during decoding (GGML compute graph execution). The model processes a single batch of tokens,
- * which is read from the plaintext file specified by `-f` or `--file`.
+ * during decoding (compute graph execution). The model processes a single batch of tokens, which
+ * is read from the plaintext file specified by `-f` or `--file`.
  *
  * For every tensor observed, the tool will print the tensor name, shape, GGML_TYPE, etc.
  *
@@ -126,6 +126,7 @@ struct tensor_stats_t {
     size_t n_infs  = 0;
 
     void read_f32(float elem) {
+        n_elements++;
         if (std::isnan(elem)) {
             n_nans++;
         }
@@ -138,26 +139,29 @@ struct tensor_stats_t {
     }
 
     void read_int(int elem) {
+        n_elements++;
         if (elem == 0) {
             n_zeros++;
         }
     }
 };
 
+// sometimes there are zero-sized tensors (to maintain a consistent graph topology).
+// we don't count those. the smallest tensor shape we care about in this tool is [1, 1, 1, 1].
+static bool tensor_is_zero_sized(const ggml_tensor * t) {
+    return t->ne[0] < 1 || t->ne[1] < 1 || t->ne[2] < 1 || t->ne[3] < 1;
+}
+
 // process a single tensor and return stats.
 // also update the session stats with the observed tensor stats.
 static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     tensor_stats_t stats;
 
-    if (!(t->ne[0] > 0 && t->ne[1] > 0 && t->ne[2] > 0 && t->ne[3] > 0)) {
-        // sometimes there are zero-sized tensors (to maintain a consistent graph topology).
-        // we don't count those. the smallest tensor shape we care about in this tool
-        // is [1, 1, 1, 1].
+    if (tensor_is_zero_sized(t)) {
         return stats;
     }
 
     const auto n_elements = static_cast<size_t>(ggml_nelements(t));
-    stats.n_elements = n_elements;
 
     switch (t->type) {
         case GGML_TYPE_F32: {
@@ -215,6 +219,7 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
             break;
     }
 
+    GGML_ASSERT(stats.n_elements == n_elements);
     return stats;
 }
 
@@ -226,9 +231,9 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         // before graph compute, the scheduler asks us if we want to observe each tensor.
         // since this tool is primarily intended for diagnosing buggy or broken models,
         // rather than for productive inference, this tool will always observe all tensors,
-        // as long as they have more than 0 elements.
+        // as long as they are not zero-sized..
         //
-        return ggml_nelements(t) > 0;
+        return !tensor_is_zero_sized(t);
     } else {
         GGML_ASSERT(t != nullptr);
         auto * session_stats = static_cast<session_stats_t *>(user_data);
@@ -252,7 +257,7 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
 
         // TODO: switch between LLAMA_LOG_WARN and LLAMA_LOG_INFO based on the results
         LLAMA_LOG_INFO(
-            "%s: %6zu: %-64s - [ %6" PRId64 ", %6" PRId64 ", %6" PRId64 ", %6" PRId64 " ], "
+            "%s: %06zu: %-64s - [ %6" PRId64 ", %6" PRId64 ", %6" PRId64 ", %6" PRId64 " ], "
             "all_zero = %5s, n_infs = %6zu, n_nans = %6zu\n", __func__,
             session_stats->n_capture, t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
             t_all_zero ? "true" : "false", t_stats.n_infs, t_stats.n_nans);
@@ -267,8 +272,7 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
 //
 //  - tokenize prompt, truncate to n_batch
 //  - fill a single batch of tokens (1 sequence only for now)
-//  - submit that batch to llama_decode
-//  - graph evaluation by `llama_decode` triggers the callback
+//  - evaluation of the batch by `llama_decode` triggers the callback
 //
 static void run_diagnostics(llama_context * ctx, const common_params & params) {
 

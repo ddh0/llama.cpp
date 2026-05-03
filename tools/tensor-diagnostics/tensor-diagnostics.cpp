@@ -14,7 +14,7 @@
  *
  *   ... tensors with ANY NaN elements (and if so, how many)
  *
- *   ... tensors whose elements are ALL zero (within tolerance [-0.005, 0.005] inclusive)
+ *   ... tensors whose elements are ALL strictly smaller than 0.005 in absolute value (all-zeros)
  *
  * All observed tensors will be captured, converted to the NumPy v1.0 format, and saved to disk.
  *
@@ -40,11 +40,10 @@
 #include <cmath>
 #include <fstream>
 #include <cinttypes>
-#include <stdexcept>
 #include <filesystem>
 
 
-// elements with absolute values smaller than this are considered to be zero
+// elements with absolute values strictly smaller than this are considered to be zero
 static constexpr float ZERO_TOLERANCE = 0.005;
 
 
@@ -74,13 +73,9 @@ namespace ggml_to_npy {
             case GGML_TYPE_I16:  return "'<i2'";
             case GGML_TYPE_I8:   return "'<i1'";
             case GGML_TYPE_BF16:
-                throw std::runtime_error("BF16 is not currently supported for NumPy export "
-                                         "(use f32 instead)");
+                GGML_ABORT("BF16 is not supported for NumPy export (should use f32 instead)");
             default:
-                throw std::runtime_error(format(
-                    "GGML type %s is not currently supported for NumPy export",
-                    ggml_type_name(type)
-                ));
+                GGML_ABORT("GGML type %s is not supported for NumPy export", ggml_type_name(type));
         }
     }
 
@@ -103,7 +98,8 @@ namespace ggml_to_npy {
 
         // write header length (2 bytes) and contents (`header_len` bytes)
         const uint16_t header_len = static_cast<uint16_t>(header.length());
-        out << reinterpret_cast<const char *>(&header_len) << header.c_str();
+        out.write(reinterpret_cast<const char *>(&header_len), sizeof(header_len));
+        out.write(header.c_str(), header.length());
 
         const size_t n_bytes = 10 + header_len;
         const size_t n_pad = (64 - (n_bytes % 64)) % 64;
@@ -134,131 +130,76 @@ struct tensor_stats_t {
 // also update the session stats with the observed tensor stats.
 static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     tensor_stats_t stats;
-    const int64_t n_elements = ggml_nelements(t);
 
-    if (n_elements > 0) {
-        // valid GGML tensor dims start at 1 (i.e. the smallest valid shape is [1, 1, 1, 1])
-        GGML_ASSERT(t->ne[0] > 0);
-        GGML_ASSERT(t->ne[1] > 0);
-        GGML_ASSERT(t->ne[2] > 0);
-        GGML_ASSERT(t->ne[3] > 0);
-        stats.n_elements = static_cast<size_t>(n_elements);
-    } else {
-        // sometimes there are zero-element tensors (to maintain a consistent graph topology).
-        // we will ignore those.
+    if (!(t->ne[0] > 0 && t->ne[1] > 0 && t->ne[2] > 0 && t->ne[3] > 0)) {
+        // sometimes there are zero-sized tensors (to maintain a consistent graph topology).
+        // we don't count those.
         return stats;
     }
+
+    const auto n_elements = static_cast<size_t>(ggml_nelements(t));
+    stats.n_elements = n_elements;
+
+    auto check_elem = [&stats](auto elem) {
+        float val = static_cast<float>(elem);
+        if (std::isnan(val)) {
+            stats.n_nans++;
+        }
+        if (std::isinf(val)) {
+            stats.n_infs++;
+        }
+        if (std::abs(val) < ZERO_TOLERANCE) {
+            stats.n_zeros++;
+        }
+    };
 
     switch (t->type) {
         case GGML_TYPE_F32: {
             const float * f32_data = (const float *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const float elem = f32_data[i];
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(f32_data[i]);
             }
             break;
         }
         case GGML_TYPE_F16: {
             const ggml_fp16_t * f16_data = (const ggml_fp16_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const float elem = ggml_fp16_to_fp32(f16_data[i]);
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(ggml_fp16_to_fp32(f16_data[i]));
             }
             break;
         }
         case GGML_TYPE_BF16: {
             const ggml_bf16_t * bf16_data = (const ggml_bf16_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const float elem = ggml_bf16_to_fp32(bf16_data[i]);
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(ggml_bf16_to_fp32(bf16_data[i]));
             }
             break;
         }
         case GGML_TYPE_I64: {
             const int64_t * i64_data = (const int64_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const int64_t elem = i64_data[i];
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(i64_data[i]);
             }
             break;
         }
         case GGML_TYPE_I32: {
             const int32_t * i32_data = (const int32_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const int32_t elem = i32_data[i];
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(i32_data[i]);
             }
             break;
         }
         case GGML_TYPE_I16: {
             const int16_t * i16_data = (const int16_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const int16_t elem = i16_data[i];
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(i16_data[i]);
             }
             break;
         }
         case GGML_TYPE_I8: {
             const int8_t * i8_data = (const int8_t *)t->data;
-            for (int64_t i = 0; i < n_elements; ++i) {
-                const int8_t elem = i8_data[i];
-                if (std::isnan(elem)) {
-                    stats.n_nans++;
-                }
-                if (std::isinf(elem)) {
-                    stats.n_infs++;
-                }
-                if (std::abs(elem) < ZERO_TOLERANCE) {
-                    stats.n_zeros++;
-                }
+            for (size_t i = 0; i < n_elements; ++i) {
+                check_elem(i8_data[i]);
             }
             break;
         }
@@ -274,6 +215,7 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
 // callback function, receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
+        GGML_ASSERT(t != nullptr);
         //
         // before graph compute, the scheduler asks us if we want to observe each tensor.
         // since this tool is primarily intended for diagnosing buggy or broken models,
@@ -282,10 +224,11 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         //
         return ggml_nelements(t) > 0;
     } else {
+        GGML_ASSERT(t != nullptr);
         auto * session_stats = static_cast<session_stats_t *>(user_data);
-        const auto t_stats = get_tensor_stats(t);
 
-        GGML_ASSERT(t_stats.n_elements != 0); // see above
+        const auto t_stats = get_tensor_stats(t);
+        GGML_ASSERT(t_stats.n_elements > 0);
 
         session_stats->n_capture++;
         session_stats->n_total_bytes_captured += ggml_nbytes(t);
@@ -301,21 +244,30 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
             session_stats->n_nan_tensors++;
         }
 
+        // TODO: switch between LLAMA_LOG_WARN and LLAMA_LOG_INFO based on the results
         LLAMA_LOG_INFO(
             "%s: %6zu: %-64s - [ %6" PRId64 ", %6" PRId64 ", %6" PRId64 ", %6" PRId64 " ], "
-            "all_zero = %5s, n_infs = %6zu, n_nans = %6zu\n", __func__, session_stats->n_capture,
-            t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t_all_zero ? "TRUE!" : "false",
-            t_stats.n_infs, t_stats.n_nans);
+            "all_zero = %5s, n_infs = %6zu, n_nans = %6zu\n", __func__,
+            session_stats->n_capture, t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t_all_zero ? "true" : "false", t_stats.n_infs, t_stats.n_nans);
 
         // TODO: write captured tensor data to disk
         return true;
     }
 }
 
-// main diagnostic operation
-static void run_diagnostics(llama_context * ctx, const common_params params) {
+//
+// diagnostic driver function
+//
+//  - tokenize prompt, truncate to n_batch
+//  - fill a single batch of tokens (1 sequence only for now)
+//  - submit that batch to llama_decode
+//  - graph evaluation by `llama_decode` triggers the callback
+//
+static void run_diagnostics(llama_context * ctx, const common_params & params) {
 
     // ensure output directory exists
+    // TODO: clean this up and make it work properly for numpy tensor output (?)
     if (!params.tensor_diag_output_dir.empty()) {
         if (!std::filesystem::exists(params.tensor_diag_output_dir)) {
             if (!std::filesystem::create_directories(params.tensor_diag_output_dir)) {
@@ -410,8 +362,6 @@ int main(int argc, char ** argv) {
     run_diagnostics(ctx, params);
 
     // TODO: session_report(session_stats);
-
-    llama_perf_context_print(ctx);
 
     llama_backend_free();
 

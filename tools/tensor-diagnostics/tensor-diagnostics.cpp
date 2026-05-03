@@ -161,49 +161,49 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
 
     switch (t->type) {
         case GGML_TYPE_F32: {
-            const float * f32_data = (const float *)t->data;
+            auto f32_data = static_cast<const float *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_f32(f32_data[i]);
             }
             break;
         }
         case GGML_TYPE_F16: {
-            const ggml_fp16_t * f16_data = (const ggml_fp16_t *)t->data;
+            auto f16_data = static_cast<const ggml_fp16_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_f32(ggml_fp16_to_fp32(f16_data[i]));
             }
             break;
         }
         case GGML_TYPE_BF16: {
-            const ggml_bf16_t * bf16_data = (const ggml_bf16_t *)t->data;
+            auto bf16_data = static_cast<const ggml_bf16_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_f32(ggml_bf16_to_fp32(bf16_data[i]));
             }
             break;
         }
         case GGML_TYPE_I64: {
-            const int64_t * i64_data = (const int64_t *)t->data;
+            auto i64_data = static_cast<const int64_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_int(i64_data[i]);
             }
             break;
         }
         case GGML_TYPE_I32: {
-            const int32_t * i32_data = (const int32_t *)t->data;
+            auto i32_data = static_cast<const int32_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_int(i32_data[i]);
             }
             break;
         }
         case GGML_TYPE_I16: {
-            const int16_t * i16_data = (const int16_t *)t->data;
+            auto i16_data = static_cast<const int16_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_int(i16_data[i]);
             }
             break;
         }
         case GGML_TYPE_I8: {
-            const int8_t * i8_data = (const int8_t *)t->data;
+            auto i8_data = static_cast<const int8_t *>(t->data);
             for (size_t i = 0; i < n_elements; ++i) {
                 stats.read_int(i8_data[i]);
             }

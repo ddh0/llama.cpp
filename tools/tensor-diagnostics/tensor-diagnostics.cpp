@@ -115,15 +115,15 @@ namespace ggml_to_npy {
 } // ggml_to_npy
 
 struct session_stats_t {
-    size_t n_capture = 0;              // incremented by 1 for every tensor that is observed by the callback
-    size_t n_total_bytes_captured = 0; // combined size of all tensor data observed
-    size_t n_zero_tensors = 0;         // total num. tensors observed whose elements were ALL zero
-    size_t n_nan_tensors = 0;          // total num. tensors observed with one or more NaN elements
-    size_t n_inf_tensors = 0;          // total num. tensors observed with one or more non-finite elements
-    size_t n_zero_sized_tensors = 0;   // number of zero-sized tensors (they are skipped)
+    size_t n_capture = 0;              // incremented by 1 for every tensor that is captured
+    size_t n_total_bytes_captured = 0; // combined size of all tensor data captured
+    size_t n_zero_tensors = 0;         // num. tensors observed whose elements were ALL zero
+    size_t n_nan_tensors = 0;          // num. tensors observed with one or more NaN elements
+    size_t n_inf_tensors = 0;          // num. tensors observed with one or more non-finite elements
 };
 
 struct tensor_stats_t {
+    size_t n_elements = 0;
     size_t n_zeros = 0;
     size_t n_nans  = 0;
     size_t n_infs  = 0;
@@ -131,10 +131,9 @@ struct tensor_stats_t {
 
 // process a single tensor and return stats.
 // also update the session stats with the observed tensor stats.
-static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, ggml_tensor * t) {
-
-    const int64_t n_elements = ggml_nelements(t);
+static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, const ggml_tensor * t) {
     tensor_stats_t stats;
+    const int64_t n_elements = ggml_nelements(t);
 
     if (n_elements > 0) {
         // valid GGML tensor dims start at 1 (i.e. the smallest valid shape is [1, 1, 1, 1])
@@ -142,10 +141,11 @@ static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, ggml_ten
         GGML_ASSERT(t->ne[1] > 0);
         GGML_ASSERT(t->ne[2] > 0);
         GGML_ASSERT(t->ne[3] > 0);
+        stats.n_elements = static_cast<size_t>(n_elements);
     } else {
-        // sometimes there are zero-element tensors, we will ignore those except to count them
-        ++session_stats->n_zero_sized_tensors;
-        return stats; // return stats of all 0s
+        // sometimes there are zero-element tensors (to maintain a consistent graph topology).
+        // we will ignore those.
+        return stats;
     }
 
     switch (t->type) {
@@ -267,25 +267,11 @@ static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, ggml_ten
             break;
     }
 
-    ++session_stats->n_capture;
-    session_stats->n_total_bytes_captured += ggml_nbytes(t);
-
-    if (stats.n_zeros == static_cast<size_t>(n_elements)) {
-        ++session_stats->n_zero_tensors;
-    }
-    if (stats.n_infs > 0) {
-        ++session_stats->n_inf_tensors;
-    }
-    if (stats.n_nans > 0) {
-        ++session_stats->n_nan_tensors;
-    }
-
     return stats;
 }
 
 // callback function, receives tensors from scheduler
 static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
-    session_stats_t * session_stats = static_cast<session_stats_t *>(user_data);
     if (ask) {
         //
         // before graph compute, the scheduler asks us if we want to observe each tensor.
@@ -294,12 +280,27 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         //
         return true;
     } else {
+        auto * session_stats = static_cast<session_stats_t *>(user_data);
         const auto t_stats = get_tensor_stats(session_stats, t);
 
-        // TODO: improve logging to show the stats we care about in real time
-        LLAMA_LOG_INFO("%s: %05zu: %-64s - [ %6lld, %6lld, %6lld, %6lld ], n_elements = %lld\n",
-                __func__, session_stats->n_capture, t->name,
-                t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_nelements(t));
+        session_stats->n_capture++;
+        session_stats->n_total_bytes_captured += ggml_nbytes(t);
+        const bool t_all_zero = t_stats.n_zeros == t_stats.n_elements;
+
+        if (t_all_zero) {
+            session_stats->n_zero_tensors++;
+        }
+        if (t_stats.n_infs > 0) {
+            session_stats->n_inf_tensors++;
+        }
+        if (t_stats.n_nans > 0) {
+            session_stats->n_nan_tensors++;
+        }
+
+        LLAMA_LOG_INFO(
+            "%s: %06zu: %-64s - [ %6lld, %6lld, %6lld, %6lld ], all_zero = %5s, n_infs = %06zu, "
+            "n_nans = %06zu\n", __func__, session_stats->n_capture, t->name, t->ne[0], t->ne[1],
+            t->ne[2], t->ne[3], t_all_zero ? "TRUE!" : "false", t_stats.n_infs, t_stats.n_nans);
 
         // TODO: write captured tensor data to disk
         return true;

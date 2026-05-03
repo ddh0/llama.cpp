@@ -32,17 +32,16 @@
 
 /* !! THIS FILE IS STILL UNDER ACTIVE DEVELOPMENT !! */
 
-#include "llama-impl.h" // needed for LLAMA_LOG_*
+#include "llama-impl.h"
 #include "llama.h"
 #include "common.h"
 #include "arg.h"
 
 #include <cmath>
 #include <fstream>
+#include <cinttypes>
 #include <stdexcept>
 #include <filesystem>
-
-#include <cinttypes>
 
 
 // elements with absolute values smaller than this are considered to be zero
@@ -278,16 +277,15 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         //
         // before graph compute, the scheduler asks us if we want to observe each tensor.
         // since this tool is primarily intended for diagnosing buggy or broken models,
-        // rather than for productive inference, this tool will always observe all tensors.
+        // rather than for productive inference, this tool will always observe all tensors,
+        // as long as they have more than 0 elements.
         //
-        return true;
+        return ggml_nelements(t) > 0;
     } else {
         auto * session_stats = static_cast<session_stats_t *>(user_data);
         const auto t_stats = get_tensor_stats(t);
 
-        if (t_stats.n_elements < 1) {
-            return true; // ignore zero-element tensors
-        }
+        GGML_ASSERT(t_stats.n_elements != 0); // see above
 
         session_stats->n_capture++;
         session_stats->n_total_bytes_captured += ggml_nbytes(t);

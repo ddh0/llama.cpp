@@ -42,6 +42,8 @@
 #include <stdexcept>
 #include <filesystem>
 
+#include <cinttypes>
+
 
 // elements with absolute values smaller than this are considered to be zero
 static constexpr float ZERO_TOLERANCE = 0.005;
@@ -302,9 +304,10 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         }
 
         LLAMA_LOG_INFO(
-            "%s: %06zu: %-64s - [ %6ld, %6ld, %6ld, %6ld ], all_zero = %5s, n_infs = %6zu, "
-            "n_nans = %6zu\n", __func__, session_stats->n_capture, t->name, t->ne[0], t->ne[1],
-            t->ne[2], t->ne[3], t_all_zero ? "TRUE!" : "false", t_stats.n_infs, t_stats.n_nans);
+            "%s: %6zu: %-64s - [ %6" PRId64 ", %6" PRId64 ", %6" PRId64 ", %6" PRId64 " ], "
+            "all_zero = %5s, n_infs = %6zu, n_nans = %6zu\n", __func__, session_stats->n_capture,
+            t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t_all_zero ? "TRUE!" : "false",
+            t_stats.n_infs, t_stats.n_nans);
 
         // TODO: write captured tensor data to disk
         return true;

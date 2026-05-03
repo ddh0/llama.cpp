@@ -131,7 +131,7 @@ struct tensor_stats_t {
 
 // process a single tensor and return stats.
 // also update the session stats with the observed tensor stats.
-static tensor_stats_t get_tensor_stats(session_stats_t * session_stats, const ggml_tensor * t) {
+static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     tensor_stats_t stats;
     const int64_t n_elements = ggml_nelements(t);
 
@@ -281,7 +281,7 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         return true;
     } else {
         auto * session_stats = static_cast<session_stats_t *>(user_data);
-        const auto t_stats = get_tensor_stats(session_stats, t);
+        const auto t_stats = get_tensor_stats(t);
 
         session_stats->n_capture++;
         session_stats->n_total_bytes_captured += ggml_nbytes(t);

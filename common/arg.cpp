@@ -1571,7 +1571,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.warmup = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG, LLAMA_EXAMPLE_TENSOR_DIAGNOSTICS}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(
@@ -3889,12 +3889,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--output-dir"}, "PATH",
-        string_format("llama-tensor-diagnostics: directory for saving numpy tensor data\n"
-                      "(default: %s)", params.tensor_diag_output_dir.c_str()),
+        string_format("directory for saving numpy tensor data (default: %s)",
+                      params.tensor_dbg_output_dir.c_str()),
         [](common_params & params, const std::string & value) {
-            params.tensor_diag_output_dir = value;
+            params.tensor_dbg_output_dir = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TENSOR_DIAGNOSTICS}));
+    ).set_examples({LLAMA_EXAMPLE_TENSOR_DEBUG}));
 
     // presets
     add_opt(common_arg(

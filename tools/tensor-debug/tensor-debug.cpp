@@ -1,12 +1,12 @@
 /**
  *
- * llama-tensor-diagnostics
+ * llama-tensor-debug
  *
  * This tool observes, prints info about, and exports to `.npy` ALL intermediate tensors (nodes)
  * during decoding (compute graph execution). The model processes a single batch of tokens, which
  * is read from the plaintext file specified by `-f` or `--file`.
  *
- * For every tensor observed, the tool will print the tensor name, shape, GGML_TYPE, etc.
+ * For every tensor observed, the tool will print the name, shape, GGML_TYPE, etc.
  *
  * Additionally, at runtime, the tool will display warnings about...
  *
@@ -80,14 +80,17 @@ namespace ggml_to_npy {
     }
 
     // write a minimal valid NumPy v1.0 header to the given file stream.
-    // NOTE: the stream should be in binary mode.
+    // NOTE: the stream must be in binary mode.
     static void write_header(std::ofstream & out, const std::string & descr,
         const int64_t ne0,
         const int64_t ne1,
         const int64_t ne2,
         const int64_t ne3)
     {
-        out << "\x93NUMPY\x01\x00"; // magic string, major version, minor version (8 bytes total)
+        // TODO: assert that the stream is in binary mode
+
+        // magic string, major version, minor version (8 bytes total)
+        out.write("\x93NUMPY\x01\x00", 8);
 
         // build header string
         std::string header = "{'descr': " + descr + ", 'fortran_order': False, 'shape': ("
@@ -111,7 +114,7 @@ namespace ggml_to_npy {
 
 } // ggml_to_npy
 
-struct session_stats_t {
+struct tensor_debug_cb_data {
     size_t n_capture = 0;              // incremented by 1 for every tensor that is captured
     size_t n_total_bytes_captured = 0; // combined size of all tensor data captured
     size_t n_zero_tensors = 0;         // num. tensors observed whose elements were ALL zero
@@ -126,22 +129,22 @@ struct tensor_stats_t {
     size_t n_infs  = 0;
 
     void read_f32(float elem) {
-        n_elements++;
+        ++n_elements;
         if (std::isnan(elem)) {
-            n_nans++;
+            ++n_nans;
         }
         if (std::isinf(elem)) {
-            n_infs++;
+            ++n_infs;
         }
         if (std::abs(elem) < ZERO_TOLERANCE) {
-            n_zeros++;
+            ++n_zeros;
         }
     }
 
     void read_int(int elem) {
-        n_elements++;
+        ++n_elements;
         if (elem == 0) {
-            n_zeros++;
+            ++n_zeros;
         }
     }
 };
@@ -224,7 +227,7 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
 }
 
 // callback function, receives tensors from scheduler
-static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
+static bool tensor_debug_cb(ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
         GGML_ASSERT(t != nullptr);
         //
@@ -236,23 +239,23 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
         return !tensor_is_zero_sized(t);
     } else {
         GGML_ASSERT(t != nullptr);
-        auto * session_stats = static_cast<session_stats_t *>(user_data);
+        auto * session_stats = static_cast<tensor_debug_cb_data *>(user_data);
 
         const auto t_stats = get_tensor_stats(t);
         GGML_ASSERT(t_stats.n_elements > 0);
 
-        session_stats->n_capture++;
+        ++session_stats->n_capture;
         session_stats->n_total_bytes_captured += ggml_nbytes(t);
         const bool t_all_zero = t_stats.n_zeros == t_stats.n_elements;
 
         if (t_all_zero) {
-            session_stats->n_zero_tensors++;
+            ++session_stats->n_zero_tensors;
         }
         if (t_stats.n_infs > 0) {
-            session_stats->n_inf_tensors++;
+            ++session_stats->n_inf_tensors;
         }
         if (t_stats.n_nans > 0) {
-            session_stats->n_nan_tensors++;
+            ++session_stats->n_nan_tensors;
         }
 
         // TODO: switch between LLAMA_LOG_WARN and LLAMA_LOG_INFO based on the results
@@ -268,21 +271,21 @@ static bool tensor_diagnostic_cb(ggml_tensor * t, bool ask, void * user_data) {
 }
 
 //
-// diagnostic driver function
+// debug driver function
 //
 //  - tokenize prompt, truncate to n_batch
 //  - fill a single batch of tokens (1 sequence only for now)
 //  - evaluation of the batch by `llama_decode` triggers the callback
 //
-static void run_diagnostics(llama_context * ctx, const common_params & params) {
+static void run_debug(llama_context * ctx, const common_params & params) {
 
     // ensure output directory exists
     // TODO: clean this up and make it work properly for numpy tensor output (?)
-    if (!params.tensor_diag_output_dir.empty()) {
-        if (!std::filesystem::exists(params.tensor_diag_output_dir)) {
-            if (!std::filesystem::create_directories(params.tensor_diag_output_dir)) {
+    if (!params.tensor_dbg_output_dir.empty()) {
+        if (!std::filesystem::exists(params.tensor_dbg_output_dir)) {
+            if (!std::filesystem::create_directories(params.tensor_dbg_output_dir)) {
                 LLAMA_LOG_ERROR("%s: failed to create directory at %s\n",
-                                __func__, params.tensor_diag_output_dir.c_str());
+                                __func__, params.tensor_dbg_output_dir.c_str());
                 return;
             }
         }
@@ -319,7 +322,7 @@ static void run_diagnostics(llama_context * ctx, const common_params & params) {
     }
     batch.n_tokens = n_batch;
 
-    LLAMA_LOG_INFO("%s: running diagnostics over %d tokens ... this may take a while ...\n",
+    LLAMA_LOG_INFO("%s: decoding %d tokens for debugging ... this may take a while ...\n",
                    __func__, n_batch);
 
     auto ret = llama_decode(ctx, batch);
@@ -335,7 +338,7 @@ int main(int argc, char ** argv) {
 
     common_init();
     common_params params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TENSOR_DIAGNOSTICS)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TENSOR_DEBUG)) {
         return 1;
     }
 
@@ -350,10 +353,10 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto session_stats = session_stats_t();
+    auto cb_data = tensor_debug_cb_data();
 
-    params.cb_eval = tensor_diagnostic_cb;
-    params.cb_eval_user_data = &session_stats;
+    params.cb_eval = tensor_debug_cb;
+    params.cb_eval_user_data = &cb_data;
 
     LLAMA_LOG_INFO("%s\n", common_params_get_system_info(params).c_str());
     common_init_result_ptr common_init = common_init_from_params(params);
@@ -369,7 +372,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx = common_init->context();
     GGML_ASSERT(ctx != nullptr);
 
-    run_diagnostics(ctx, params);
+    run_debug(ctx, params);
 
     // TODO: session_report(session_stats);
 

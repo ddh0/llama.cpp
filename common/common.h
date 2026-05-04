@@ -95,7 +95,7 @@ enum llama_example {
     LLAMA_EXAMPLE_FIT_PARAMS,
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
-    LLAMA_EXAMPLE_TENSOR_DIAGNOSTICS,
+    LLAMA_EXAMPLE_TENSOR_DEBUG,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -681,8 +681,8 @@ struct common_params {
     // batched-bench params
     bool batched_bench_output_jsonl = false;
 
-    // --output-dir, only used for llama-tensor-diagnoistic tool
-    std::string tensor_diag_output_dir = "./diag-output";
+    // --output-dir, only used for llama-tensor-debug tool
+    std::string tensor_dbg_output_dir = "./debug-output";
 
     // common params
     std::string out_file; // output filename for all example programs

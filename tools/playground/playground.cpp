@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <random>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
+#include <cstdint>
 
 #define TDIM "%7" PRId64 // tensor dimension format string
 #define TNAME "%-54s"    // tensor name format string
@@ -89,11 +92,18 @@ struct tensor_stats_t {
         m2 += delta * delta2;
     }
 
-    double get_variance() const {
+    float get_variance() const {
         if (n_elem < 2) {
             return 0.0;
         }
-        return m2 / n_elem;
+        return static_cast<float>(m2 / n_elem);
+    }
+
+    float get_stddev() const {
+        if (n_elem < 2) {
+            return 0.0;
+        }
+        return static_cast<float>(std::sqrt(m2 / n_elem));
     }
 };
 
@@ -156,50 +166,52 @@ static tensor_stats_t get_tensor_stats(const ggml_tensor * t) {
     return stats;
 }
 
-#include <sstream>
-#include <iomanip>
-#include <cstdint>
-
+// get a string representing the memory address of the tensor struct
 std::string tensor_get_addr(const ggml_tensor * t) {
     std::ostringstream oss;
-    oss << "0x" << std::hex << std::setfill('0') << std::setw(sizeof(void *) * 2) << static_cast<const void *>(t);
+    oss << "0x" << std::hex << std::setfill('0') << std::setw(sizeof(void *) * 2)
+        << static_cast<const void *>(t);
     return oss.str();
 }
 
-void print_tensor(const ggml_tensor * t, bool include_stats) {
+void print_tensor_with_stats(const ggml_tensor * t) {
     GGML_ASSERT(t != nullptr);
     GGML_ASSERT(!ggml_is_empty(t) && "tensor is empty");
     const auto t_stats = get_tensor_stats(t);
     const bool t_all_zero = t_stats.n_zeros == t_stats.n_elem;
     if (t_all_zero || t_stats.n_infs > 0 || t_stats.n_nans > 0) {
         LOG_WRN(
-            "%4s: " TNAME " [ " TDIM ", " TDIM ", " TDIM ", " TDIM " ] all zero = %1s, "
-            "infs = %7zu, nans = %5zu, min = %9.2f, avg = %6.2f, max = %9.2f, var = %9.2f\n",
-            ggml_type_name(t->type), t->name, t->ne[0], t->ne[1], t->ne[2],
-            t->ne[3], t_all_zero ? "1" : "0", t_stats.n_infs, t_stats.n_nans, t_stats.min_val,
-            t_stats.mean, t_stats.max_val, t_stats.get_variance());
+            "%s: %4s: [ " TDIM ", " TDIM ", " TDIM ", " TDIM " ] all zero = %1s, infs = %7zu, "
+            "nans = %5zu, min = %9.2f, avg = %6.2f, max = %9.2f, stddev = %9.2f\n",
+            tensor_get_addr(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t_all_zero ? "1" : "0", t_stats.n_infs, t_stats.n_nans, t_stats.min_val, t_stats.mean,
+            t_stats.max_val, t_stats.get_stddev());
     } else {
         LOG_INF(
-            "%4s: " TNAME " [ " TDIM ", " TDIM ", " TDIM ", " TDIM " ] all zero = %1s, "
-            "infs = %7zu, nans = %5zu, min = %9.2f, avg = %6.2f, max = %9.2f, var = %9.2f\n",
-            ggml_type_name(t->type), t->name, t->ne[0], t->ne[1], t->ne[2],
-            t->ne[3], t_all_zero ? "1" : "0", t_stats.n_infs, t_stats.n_nans, t_stats.min_val,
-            t_stats.mean, t_stats.max_val, t_stats.get_variance());
+            "%s: %4s: [ " TDIM ", " TDIM ", " TDIM ", " TDIM " ] all zero = %1s, infs = %7zu, "
+            "nans = %5zu, min = %9.2f, avg = %6.2f, max = %9.2f, stddev = %9.2f\n",
+            tensor_get_addr(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t_all_zero ? "1" : "0", t_stats.n_infs, t_stats.n_nans, t_stats.min_val, t_stats.mean,
+            t_stats.max_val, t_stats.get_stddev());
     }
 }
 
 // helper function for lazy developers
 ggml_tensor * new_tensor(struct ggml_context * ctx, const int64_t ncols, const int64_t nrows, const int64_t ne2, const int64_t ne3) {
-    return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, /* ne0 */ ncols, /* ne1 */ nrows, ne2, ne3);
+    return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, /* ne0 = */ ncols, /* ne1 = */ nrows, ne2, ne3);
 }
 
-// overwrite one column of a 2D tensor with values drawn from a gaussian distribution
-void column_fill_gaussian(ggml_tensor * t, const int64_t col_idx, float mean, float stddev) {
+// overwrite one column of a 2D or 3D tensor with values drawn from a gaussian distribution
+void column_fill_gaussian(ggml_tensor * t, const int64_t col_idx, const int64_t ne2_idx, const float mean, const float stddev) {
     GGML_ASSERT(t != nullptr);
+    GGML_ASSERT(t->type == GGML_TYPE_F32 && "only F32 tensors are supported here");
     GGML_ASSERT(!ggml_is_empty(t) && "tensor is empty");
-    GGML_ASSERT(t->type == GGML_TYPE_F32 && "only F32 tensors are supported");
-    GGML_ASSERT(t->ne[2] == t->ne[3] == 1 && "only 2D tensors are supported");
-    GGML_ASSERT(col_idx >= 0 && col_idx < t->ne[0] && "invalid column index");
+    GGML_ASSERT(t->ne[3] == 1 && "4D tensors are not supported here");
+    const int64_t ne0 = t->ne[0]; // ncols
+    const int64_t ne1 = t->ne[1]; // nrows
+    const int64_t ne2 = t->ne[2]; // 3D slices
+    GGML_ASSERT(ne2_idx >= 0 && ne2_idx < ne2 && "invalid ne2 (3D slice) index");
+    GGML_ASSERT(col_idx >= 0 && col_idx < ne0 && "invalid ne0 (column) index");
 
     std::normal_distribution<float> dist(mean, stddev);
 
@@ -208,28 +220,29 @@ void column_fill_gaussian(ggml_tensor * t, const int64_t col_idx, float mean, fl
 
     auto data = static_cast<float *>(t->data);
 
-    for (int64_t i1 = 0; i1 < nrows; i1++) {
-        data[col_idx + i1 * ncols] = dist(global_rng());
+    for (int64_t i = 0; i < ne1; i++) {
+        data[col_idx + i * ne0] = dist(global_rng());
     }
 }
 
-// overwrite one column of a 2D tensor with values drawn from a uniform distribution
-void column_fill_uniform(ggml_tensor * t, const int64_t col_idx, float min, float max) {
+// overwrite one column of a 2D or 3D tensor with values drawn from a uniform distribution
+void column_fill_uniform(ggml_tensor * t, const int64_t col_idx, const int64_t ne2_idx, const float min, const float max) {
     GGML_ASSERT(t != nullptr);
+    GGML_ASSERT(t->type == GGML_TYPE_F32 && "only F32 tensors are supported here");
     GGML_ASSERT(!ggml_is_empty(t) && "tensor is empty");
-    GGML_ASSERT(t->type == GGML_TYPE_F32 && "only F32 tensors are supported");
-    GGML_ASSERT(t->ne[2] == t->ne[3] == 1 && "only 2D tensors are supported");
-    GGML_ASSERT(col_idx >= 0 && col_idx < t->ne[0] && "invalid column index");
-
-    const int64_t ncols = t->ne[0];
-    const int64_t nrows = t->ne[1];
+    GGML_ASSERT(t->ne[3] == 1 && "4D tensors are not supported here");
+    const int64_t ne0 = t->ne[0]; // ncols
+    const int64_t ne1 = t->ne[1]; // nrows
+    const int64_t ne2 = t->ne[2]; // 3D slices
+    GGML_ASSERT(ne2_idx >= 0 && ne2_idx < ne2 && "invalid ne2 (3D slice) index");
+    GGML_ASSERT(col_idx >= 0 && col_idx < ne0 && "invalid column index");
 
     std::uniform_real_distribution<float> dist(min, max);
 
     auto data = static_cast<float *>(t->data);
 
-    for (int64_t i1 = 0; i1 < nrows; i1++) {
-        data[col_idx + i1 * ncols] = dist(global_rng());
+    for (int64_t i = 0; i < ne1; i++) {
+        data[col_idx + i * ne0] = dist(global_rng());
     }
 }
 

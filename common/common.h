@@ -105,6 +105,7 @@ enum llama_example {
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
+    LLAMA_EXAMPLE_TENSOR_DEBUG,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -518,6 +519,9 @@ struct common_params {
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
+
+    // llama-tensor-debug output dir
+    std::string tensor_dbg_output_dir = "";
 
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)

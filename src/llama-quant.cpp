@@ -909,6 +909,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     quantize_state_impl qs(*model, params);
 
+    // these need to be set to n_layer by default
+    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
+
     if (params->only_copy) {
         ftype = ml.ftype;
     }

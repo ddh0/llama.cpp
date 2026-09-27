@@ -27,19 +27,19 @@
 #include <vector>
 
 
-// cosine similarity between two equal-length f32 vectors
+// cosine similarity between two equal-length vectors
 static float cossim(const float * a, const float * b, int64_t n) {
     double dot = 0.0, na = 0.0, nb = 0.0;
     for (int64_t i = 0; i < n; ++i) {
-        dot += (double) a[i] * (double) b[i];
-        na  += (double) a[i] * (double) a[i];
-        nb  += (double) b[i] * (double) b[i];
+        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        na  += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        nb  += static_cast<double>(b[i]) * static_cast<double>(b[i]);
     }
     const double den = std::sqrt(na) * std::sqrt(nb);
     return den > 0.0 ? (float) (dot / den) : 0.0f;
 }
 
-// L2 norm distance between two equal-length f32 vectors
+// L2 norm distance between two equal-length vectors
 static float l2_distance(const float * a, const float * b, int64_t n) {
     double s = 0.0;
     for (int64_t i = 0; i < n; ++i) {
@@ -49,7 +49,7 @@ static float l2_distance(const float * a, const float * b, int64_t n) {
     return (float) std::sqrt(s);
 }
 
-// L2 magnitude (norm) of a f32 vector
+// L2 norm of a vector
 static float l2_norm(const float * a, int64_t n) {
     double s = 0.0;
     for (int64_t i = 0; i < n; ++i) {
@@ -131,12 +131,8 @@ static bool tensor_is_layer_output(const ggml_tensor * t) {
     return extract_layer(t->name) >= 0;
 }
 
-// ---------------------------------------------------------------------------
-// the eval callback
-// ---------------------------------------------------------------------------
-
 static bool cb(ggml_tensor * t, bool ask, void * user_data) {
-    auto * st = static_cast<cb_data *>(user_data);
+    auto * data = static_cast<cb_data *>(user_data);
 
     if (ask) {
         // scheduler is asking if we want this node; only take l_out
@@ -144,8 +140,9 @@ static bool cb(ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const int layer = extract_layer(t->name);
-    if (layer < 0 || layer >= st->n_layer) {
-        return true; // defensive; should not happen after the ask filter
+
+    if (layer < 0 || layer >= data->n_layer) { // should not happen
+        return true;
     }
 
     // hidden state layout: [n_embd, n_tokens]  (ne[0]=n_embd fastest, ne[1]=n_tokens)
@@ -158,36 +155,35 @@ static bool cb(ggml_tensor * t, bool ask, void * user_data) {
     const tensor_data_view view = tensor_get_view(t);
     const float * cur = (const float *) view.data();
 
-    auto & m = st->metrics[layer];
+    auto & m = data->metrics[layer];
 
-    // L2 magnitude of this layer's output, averaged over tokens
+    // L2 norm of this layer's output, averaged over tokens
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const float * c = cur + tok * n_embd;
-        m.sum_l2_mag += (double) l2_norm(c, n_embd);
-        m.count      += 1;   // TODO: decide whether mag/dist/cossim share one count
+        m.sum_l2_norm += (double) l2_norm(c, n_embd);
+        m.count += 1;
     }
 
     // pair against the previous layer's output (same token positions, same decode)
-    if (layer > 0 && st->prev_valid[layer - 1]) {
-        auto & pm = st->metrics[layer - 1];
-        const std::vector<float> & prev = st->prev[layer - 1];
+    if (layer > 0 && data->prev_valid[layer - 1]) {
+        const std::vector<float> & prev = data->prev[layer - 1];
         // shapes must match; if a decode produced a different n_tokens, skip pairing
         if ((int64_t) prev.size() == n_embd * n_tokens) {
             for (int64_t tok = 0; tok < n_tokens; ++tok) {
                 const float * c = cur + tok * n_embd;
                 const float * p = prev.data() + tok * n_embd;
-                m.sum_cossim  += (double) cossim(c, p, n_embd);
+                m.sum_cos_sim  += (double) cossim(c, p, n_embd);
                 m.sum_l2_dist += (double) l2_distance(c, p, n_embd);
             }
-            // count already advanced above for mag; see TODO on shared vs separate counts
+            // count already advanced above for mag
         }
     }
 
     // stash current as the "previous" for the next layer to compare against.
     // layers fire 0..n_layer-1 in order within a decode, so prev[layer] = cur here
     // and layer N reads prev[layer-1]. Reset handled by ... (TODO: decode boundary)
-    st->prev[layer].assign(cur, cur + n_embd * n_tokens);
-    st->prev_valid[layer] = true;
+    data->prev[layer].assign(cur, cur + n_embd * n_tokens);
+    data->prev_valid[layer] = true;
 
     return true;
 }
@@ -271,9 +267,7 @@ int main(int argc, char ** argv) {
     common_init();
     common_params params;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TENSOR_DEBUG, print_usage)) {
-        // TODO: add a dedicated LLAMA_EXAMPLE_LAYER_COSSIM enum + print_usage,
-        //       or reuse an existing example id for now.
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LAYER_STATS, print_usage)) {
         return EXIT_FAILURE;
     }
 

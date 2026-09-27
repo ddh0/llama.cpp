@@ -23,8 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <string>
-#include <vector>
+#include <cstdint>
 
 
 // cosine similarity between two equal-length vectors
@@ -259,6 +258,10 @@ static bool run_layer_cossim(llama_context * ctx, const std::string & prompt) {
         return false;
     }
     return true;
+}
+
+static void print_usage(int argc, char ** argv) {
+    // TODO
 }
 
 int main(int argc, char ** argv) {

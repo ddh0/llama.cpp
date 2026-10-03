@@ -280,13 +280,13 @@ static void print_report(const cb_data_t & state) {
 
     // sort by L2 distance to previous layer, descending (most change first)
     // TODO: make the ranking metric configurable via a CLI flag?
-    std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
-        return a.l2_dist > b.l2_dist;
-    });
+    // std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
+    //     return a.l2_dist > b.l2_dist;
+    // });
 
     printf("\n");
     printf("%6s  %6s  %14s  %14s  %12s  %12s  %12s\n",
-           "rank", "layer", "cos_sim->prev", "L2dist->prev", "L2", "L1", "Linf");
+           "rank", "layer", "cos_sim to prev.", "L2 norm dist. to prev.", "L2 norm", "L1 norm", "L-inf norm");
     printf("--------------------------------------------------------------------------------\n");
 
     int rank = 1;

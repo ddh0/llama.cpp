@@ -218,7 +218,6 @@ struct layer_row {
 };
 
 static void print_report(const cb_data_t & state) {
-    GGML_UNUSED(state); // TODO!
     std::vector<layer_row> rows;
 
     for (const auto & kv : state.stats) {
@@ -273,9 +272,7 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
     const int n_ctx = static_cast<int>(tokens.size());
 
     llama_batch batch = llama_batch_init(n_ctx, 0, 1);
-    for (int i = 0; i < n_ctx; ++i) {
-        common_batch_add(batch, tokens[i], i, { 0 }, i == n_ctx - 1);
-    }
+    // TODO: fill batch correctly
 
     LOG_INF("%s: decoding %d tokens ...\n", __func__, batch.n_tokens);
     if (llama_decode(ctx, batch) != 0) {

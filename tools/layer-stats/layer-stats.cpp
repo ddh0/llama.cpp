@@ -1,318 +1,335 @@
 /**
- *
  * llama-layer-stats
  *
- *
- * Measure the hidden state between layers during inference. Average over all tokens.
- *
- * Report three metrics per layer:
- *
- * - cos_sim :  cosine similarity of    l_out[N] vs. l_out[N-1 ]   (per token, averaged)
- * - l2_dist :  L2 norm distance      ||l_out[N]  -  l_out[N-1]||  (per token, averaged)
- * - l2_norm :  L2 norm               ||l_out[N]||                 (per token, averaged)
- *
+ * TODO: support `l_last` for mHC models
 **/
 
-#include "llama.h"
-#include "common.h"
 #include "arg.h"
+#include "common.h"
 #include "log.h"
+#include "llama.h"
 
 #include <algorithm>
-#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <cstdint>
+#include <clocale>
+#include <map>
+#include <string>
+#include <vector>
 
+//
+// per-layer accumulated statistics
+//
 
-// cosine similarity between two equal-length vectors
-static float cossim(const float * a, const float * b, int64_t n) {
-    double dot = 0.0, na = 0.0, nb = 0.0;
+// running sums for a single layer; every field is summed over observed tokens
+struct layer_data_t {
+    // pairwise (vs previous layer / input embedding)
+    double sum_cos_sim = 0.0; // sum of cos(h_N, h_{N-1}) per token
+    double sum_l2_dist = 0.0; // sum of ||h_N - h_{N-1}||_2 per token
+
+    // self (vs zero)
+    double sum_l2_norm = 0.0; // sum of ||h_N||_2 per token
+    double sum_l1_norm = 0.0; // sum of ||h_N||_1 per token
+    double sum_inf_norm = 0.0; // sum of ||h_N||_inf per token
+
+    int64_t n_tokens = 0; // number of tokens these sums are accumulated over
+};
+
+struct cb_data_t {
+    int n_layer = 0; // number of layers in the model (for bounds / sanity checks)
+
+    // per-layer running stats, indexed by layer number
+    std::map<int, layer_data_t> stats;
+
+    // previous layer's hidden state, per token: prev[layer] holds h_{layer-1}
+    // laid out as [n_embd] contiguous floats per token
+    std::map<int, std::vector<float>> prev;
+
+    // TODO: measure against model input?
+    bool have_input = false;
+};
+
+static float cos_sim(const float * a, const float * b, int64_t n) {
+    double dot = 0.0;
+    double na  = 0.0;
+    double nb  = 0.0;
     for (int64_t i = 0; i < n; ++i) {
         dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
         na  += static_cast<double>(a[i]) * static_cast<double>(a[i]);
         nb  += static_cast<double>(b[i]) * static_cast<double>(b[i]);
     }
-    const double den = std::sqrt(na) * std::sqrt(nb);
-    return den > 0.0 ? (float) (dot / den) : 0.0f;
+    if (na <= 0.0 || nb <= 0.0) {
+        return 0.0f; // handle this in the caller!
+    }
+    return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb)));
 }
 
-// L2 norm distance between two equal-length vectors
-static float l2_distance(const float * a, const float * b, int64_t n) {
+static float l2_norm(const float * x, int64_t n) {
     double s = 0.0;
     for (int64_t i = 0; i < n; ++i) {
-        const double d = (double) a[i] - (double) b[i];
+        s += static_cast<double>(x[i]) * static_cast<double>(x[i]);
+    }
+    return static_cast<float>(std::sqrt(s));
+}
+
+static float l2_dist(const float * a, const float * b, int64_t n) {
+    double s = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
         s += d * d;
     }
-    return (float) std::sqrt(s);
+    return static_cast<float>(std::sqrt(s));
 }
 
-// L2 norm of a vector
-static float l2_norm(const float * a, int64_t n) {
+static float l1_norm(const float * x, int64_t n) {
     double s = 0.0;
     for (int64_t i = 0; i < n; ++i) {
-        s += (double) a[i] * (double) a[i];
+        s += std::fabs(static_cast<double>(x[i]));
     }
-    return (float) std::sqrt(s);
+    return static_cast<float>(s);
 }
 
-//
-// backend-agnostic tensor data access helpers
-//
-
-struct tensor_data_view {
-    tensor_data_view(void * p) : ptr_(p), buf_({}) {}
-    tensor_data_view(std::vector<char> && buf) : ptr_(buf.data()), buf_(std::move(buf)) {}
-    inline void * data() const { return ptr_; }
-
-    private:
-        void * ptr_;
-        std::vector<char> buf_;
-};
-
-static tensor_data_view tensor_get_view(const ggml_tensor * t) {
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        return tensor_data_view(t->data);
+static float inf_norm(const float * x, int64_t n) {
+    double s = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        s = std::max(s, std::fabs(static_cast<double>(x[i])));
     }
+    return static_cast<float>(s);
+}
+
+// tensor data helper
+static const float * tensor_get_f32(const ggml_tensor * t, std::vector<float> & scratch) {
     const size_t nbytes = ggml_nbytes(t);
-    std::vector<char> buf(nbytes);
-    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-    return tensor_data_view(std::move(buf));
+
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        return static_cast<const float *>(t->data);
+    }
+
+    scratch.resize(nbytes / sizeof(float));
+    ggml_backend_tensor_get(t, scratch.data(), 0, nbytes);
+    return scratch.data();
 }
 
-// per-layer accumulated metrics
-struct layer_metrics {
-    int64_t count = 0;
-    double sum_cos_sim = 0.0;
-    double sum_l2_dist = 0.0;
-    double sum_l2_norm = 0.0;
-    bool has_prev = false;
-};
-
-// session state passed to the callback
-struct cb_data {
-    int n_layer = 0; // set once we know the model depth // TODO: is this really needed?
-    std::vector<layer_metrics> metrics; // index by layer (length n_layer)
-
-    // previous l_out hidden states, one flat f32 buffer per layer:
-    // layout:
-    //         [n_tokens][n_embd], row-major, contiguous F32
-    //
-    // keyed by layer so we pair l_out[N] with l_out[N-1] of the SAME decode
-    // prev[layer] holds l_out[layer-1]? see TODO below
-    std::vector<std::vector<float>> prev;
-    std::vector<bool>               prev_valid;
-
-    // scratch reused across observations to avoid realloc
-    std::vector<float> scratch;
-};
-
-// return layer index from tensor name "l_out-{li}"
-//
-// TODO: support "l_last-{li}" for mHC models (and other names?)
-static int extract_layer(const std::string & name) {
-    static const std::string key = "l_out-";
-    if (name.rfind(key, 0) != 0) {
-        return -1;
-    }
-    try {
-        return std::stoi(name.substr(key.size()));
-    } catch (...) {
-        return -1;
-    }
-}
-
-static bool tensor_is_layer_output(const ggml_tensor * t) {
-    if (t == nullptr || ggml_is_empty(t)) {
+// filter: only ask for the layer-output node.
+// TODO: extend match set to "l_last" to support mHC models
+static bool is_layer_output(const ggml_tensor * t) {
+    if (t == nullptr || t->name[0] == '\0') {
         return false;
     }
-    return extract_layer(t->name) >= 0;
+
+    // node names are formatted `%s-%d` (name, layer index), e.g. "l_out-19"
+    // for layer 20 (0-indexed). Match the "l_out-" prefix and require at least
+    // one trailing digit.
+    const char * prefix = "l_out-";
+    const size_t plen   = strlen(prefix);
+    if (strncmp(t->name, prefix, plen) != 0) {
+        return false;
+    }
+    return t->name[plen] != '\0' && isdigit(static_cast<unsigned char>(t->name[plen]));
 }
 
-static bool cb(ggml_tensor * t, bool ask, void * user_data) {
-    auto * data = static_cast<cb_data *>(user_data);
+// parse the layer index out of a `l_out-<il>` node name.
+// returns -1 if the name does not match the expected format.
+static int parse_layer_index(const ggml_tensor * t) {
+    const char * dash = strrchr(t->name, '-');
+    if (dash == nullptr || dash == t->name) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long il = strtol(dash + 1, &end, 10);
+    if (end == dash + 1 || *end != '\0') {
+        return -1;
+    }
+    return static_cast<int>(il);
+}
+
+// the scheduler calls with ask=true to ask if we want this tensor, then with
+// ask=false to let us read it.
+static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * state = static_cast<cb_data_t *>(user_data);
 
     if (ask) {
-        // scheduler is asking if we want this node; only take l_out
-        return tensor_is_layer_output(t);
+        return is_layer_output(t);
     }
 
-    const int layer = extract_layer(t->name);
-
-    if (layer < 0 || layer >= data->n_layer) { // should not happen
+    const int layer = parse_layer_index(t);
+    if (layer < 0) {
+        LOG_ERR("%s: could not parse layer index from tensor name '%s'\n", __func__, t->name);
+        return true;
+    }
+    if (state->n_layer > 0 && layer >= state->n_layer) {
+        LOG_ERR("%s: layer index %d out of range (n_layer=%d)\n", __func__, layer, state->n_layer);
         return true;
     }
 
-    // hidden state layout: [n_embd, n_tokens]  (ne[0]=n_embd fastest, ne[1]=n_tokens)
+    // `l_out` shape is [n_embd, n_tokens, ...] (ne[0] = n_embd, ne[1] = n_tokens)
     const int64_t n_embd   = t->ne[0];
     const int64_t n_tokens = t->ne[1];
 
-    // TODO: guard against unexpected rank/type. Expect 2D F32 [n_embd, n_tokens].
-    //       If a model emits a different type we should cast (see tensor-debug's switch).
+    std::vector<float> scratch;
+    const float * data = tensor_get_f32(t, scratch);
 
-    const tensor_data_view view = tensor_get_view(t);
-    const float * cur = (const float *) view.data();
+    auto & st = state->stats[layer];
 
-    auto & m = data->metrics[layer];
-
-    // L2 norm of this layer's output, averaged over tokens
+    // per-token loop
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
-        const float * c = cur + tok * n_embd;
-        m.sum_l2_norm += (double) l2_norm(c, n_embd);
-        m.count += 1;
-    }
+        const float * h = data + tok * n_embd; // current layer's token vector
 
-    // pair against the previous layer's output (same token positions, same decode)
-    if (layer > 0 && data->prev_valid[layer - 1]) {
-        const std::vector<float> & prev = data->prev[layer - 1];
-        // shapes must match; if a decode produced a different n_tokens, skip pairing
-        if ((int64_t) prev.size() == n_embd * n_tokens) {
-            for (int64_t tok = 0; tok < n_tokens; ++tok) {
-                const float * c = cur + tok * n_embd;
-                const float * p = prev.data() + tok * n_embd;
-                m.sum_cos_sim  += (double) cossim(c, p, n_embd);
-                m.sum_l2_dist += (double) l2_distance(c, p, n_embd);
+        // self metrics (always computable)
+        st.sum_l2_norm   += l2_norm(h, n_embd);
+        st.sum_l1_norm   += l1_norm(h, n_embd);
+        st.sum_inf_norm += inf_norm(h, n_embd);
+
+        // pairwise metrics (need a previous vector)
+        // layer 0 uses the input embedding as "previous" if we captured it
+        const float * prev = nullptr;
+        if (layer > 0) {
+            auto it = state->prev.find(layer - 1);
+            if (it != state->prev.end() && static_cast<int64_t>(it->second.size()) == n_embd * n_tokens) {
+                prev = it->second.data() + tok * n_embd;
             }
-            // count already advanced above for mag
         }
+
+        if (prev) {
+            st.sum_cos_sim += cos_sim(h, prev, n_embd);
+            st.sum_l2_dist += l2_dist(h, prev, n_embd);
+        }
+
+        st.n_tokens++;
     }
 
-    // stash current as the "previous" for the next layer to compare against.
-    // layers fire 0..n_layer-1 in order within a decode, so prev[layer] = cur here
-    // and layer N reads prev[layer-1]. Reset handled by ... (TODO: decode boundary)
-    data->prev[layer].assign(cur, cur + n_embd * n_tokens);
-    data->prev_valid[layer] = true;
+    state->prev[layer].assign(data, data + n_embd * n_tokens);
 
     return true;
 }
 
-static void print_report(const cb_data & data) {
+//
+// reporting
+//
 
-    struct row {
-        int layer;
-        double cossim;
-        double l2_dist;
-        double l2_mag;
-    };
+struct layer_row {
+    int layer;
+    double cos_sim;
+    double l2_dist;
+    double l2;
+    double l1;
+    double linf;
+};
 
-    std::vector<row> rows;
+static void print_report(const cb_data_t & state) {
+    GGML_UNUSED(state); // TODO!
+    std::vector<layer_row> rows;
 
-    for (int i = 0; i < data.n_layer; ++i) {
-        const auto & m = data.metrics[i];
-        if (m.count == 0) {
+    for (const auto & kv : state.stats) {
+        const int layer = kv.first;
+        const auto & s   = kv.second;
+        if (s.n_tokens <= 0) {
             continue;
         }
-        rows.push_back({
-            i, m.sum_cos_sim / static_cast<double>(m.count),
-               m.sum_l2_dist / static_cast<double>(m.count),
-               m.sum_l2_norm / static_cast<double>(m.count),
+        const double n = static_cast<double>(s.n_tokens);
+        rows.push_back(layer_row{
+            layer,
+            s.sum_cos_sim / n,
+            s.sum_l2_dist / n,
+            s.sum_l2_norm / n,
+            s.sum_l1_norm / n,
+            s.sum_inf_norm / n,
         });
     }
 
-    // TODO: sort? decide the single "importance" ordering?
+    // sort by L2 distance to previous layer, descending (most change first)
+    // TODO: make the ranking metric configurable via a CLI flag?
+    std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
+        return a.l2_dist > b.l2_dist;
+    });
 
-    LOG_INF("\n%6s  %12s  %14s  %12s\n", "rank", "cossim", "l2_dist", "l2_mag");
-    LOG_INF("========================================================\n");
-    int r = 1;
-    for (const auto & x : rows) {
-        LOG_INF("%6d  %12.6f  %14.6f  %12.6f\n", r++, x.cossim, x.l2_dist, x.l2_mag);
+    printf("\n");
+    printf("%6s  %6s  %14s  %14s  %12s  %12s  %12s\n",
+           "rank", "layer", "cos_sim->prev", "L2dist->prev", "L2", "L1", "Linf");
+    printf("--------------------------------------------------------------------------------\n");
+
+    int rank = 1;
+    for (const auto & r : rows) {
+        printf("%6d  %6d  %14.6f  %14.6f  %12.4f  %12.4f  %12.4f\n",
+               rank++, r.layer, r.cos_sim, r.l2_dist, r.l2, r.l1, r.linf);
     }
-    LOG_INF("\n");
+    printf("\n");
 }
 
 //
 // driver
 //
-// TODO: decide input shape: single -p prompt, or -f calibration file chunked like
-//       imatrix's compute_imatrix? For a first cut, one prompt / one decode is enough.
-static bool run_layer_cossim(llama_context * ctx, const std::string & prompt) {
-    const llama_model * model = llama_get_model(ctx);
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    LOG_INF("%s: tokenizing prompt ...\n", __func__);
-    std::vector<llama_token> tokens = common_tokenize(ctx, prompt, add_bos, /*parse_special=*/false);
+static void run_layer_stats(llama_context * ctx, const common_params & params) {
+    LOG_INF("%s: tokenizing the input ..\n", __func__);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
 
-    const int n_batch = llama_n_batch(ctx);
-    if ((int) tokens.size() > n_batch) {
-        tokens.resize(n_batch); // TODO: support multi-batch; for now cap at n_batch
+    if (tokens.empty()) {
+        LOG_ERR("%s: no tokens produced from prompt\n", __func__);
+        return;
     }
 
-    llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
-    for (int i = 0; i < (int) tokens.size(); ++i) {
-        batch.token[i]  = tokens[i];
-        batch.pos[i]    = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = false;
+    const int n_ctx = static_cast<int>(tokens.size());
+
+    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+    for (int i = 0; i < n_ctx; ++i) {
+        common_batch_add(batch, tokens[i], i, { 0 }, i == n_ctx - 1);
     }
-    batch.n_tokens = (int) tokens.size();
 
     LOG_INF("%s: decoding %d tokens ...\n", __func__, batch.n_tokens);
-    const int ret = llama_decode(ctx, batch);
-    llama_batch_free(batch);
-
-    if (ret != 0) {
-        LOG_ERR("%s: llama_decode failed (%d)\n", __func__, ret);
-        return false;
+    if (llama_decode(ctx, batch) != 0) {
+        LOG_ERR("%s: llama_decode failed\n", __func__);
     }
-    return true;
+
+    llama_batch_free(batch);
 }
 
 static void print_usage(int argc, char ** argv) {
-    // TODO
+    GGML_UNUSED(argc); GGML_UNUSED(argv); // TODO
 }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_init();
+
     common_params params;
+    params.warmup = false; // avoid capturing an empty warmup pass
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LAYER_STATS, print_usage)) {
-        return EXIT_FAILURE;
+        return 1;
     }
 
     if (params.prompt.empty()) {
-        LOG_ERR("%s: no prompt provided; please specify `-p / --prompt` or `-f / --file`\n", __func__);
-        return EXIT_FAILURE;
+        LOG_ERR("no prompt provided: please specify -p / --prompt OR -f / --file\n");
+        return 1;
     }
 
-    // no warmup: it would fire the callback on an empty run
-    params.warmup = false;
+    cb_data_t state;
 
-    // session state lives on main's stack; must outlive llama_decode
-    cb_data state;
+    params.cb_eval = cb;
+    params.cb_eval_user_data = &state;
 
-    params.cb_eval            = cb;
-    params.cb_eval_user_data  = &state;
-
-    LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto init = common_init_from_params(params);
-    llama_model * model = init->model();
-    llama_context * ctx = init->context();
+    auto llama_init = common_init_from_params(params);
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
+
     if (model == nullptr || ctx == nullptr) {
-        LOG_ERR("%s: failed to init\n", __func__);
-        return EXIT_FAILURE;
+        LOG_ERR("%s: failed to init model/context\n", __func__);
+        return 1;
     }
 
-    // size the per-layer containers now that we know the depth
-    // TODO: get n_layer robustly (llama_model_n_layers / hparams); confirm API name
-    state.n_layer  = 32; // FIXME: replace with real n_layer
-    state.metrics.assign(state.n_layer, {});
-    state.prev.assign(state.n_layer, {});
-    state.prev_valid.assign(state.n_layer, false);
+    // now that the model is loaded, fill in the layer count
+    state.n_layer = llama_model_n_layer(model);
 
-    const bool ok = run_layer_cossim(ctx, params.prompt);
+    run_layer_stats(ctx, params);
 
-    if (ok) {
-        print_report(state);
-    }
+    print_report(state);
 
     llama_backend_free();
-    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    return 0;
 }

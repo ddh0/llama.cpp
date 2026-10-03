@@ -1,4 +1,5 @@
 /**
+ *
  * llama-layer-stats
  *
  * TODO: support `l_last` for mHC models
@@ -6,29 +7,26 @@
 
 #include "arg.h"
 #include "common.h"
-#include "log.h"
 #include "llama.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <clocale>
+#include <cctype>
 #include <map>
 #include <string>
 #include <vector>
 
-//
 // per-layer accumulated statistics
-//
-
-// running sums for a single layer; every field is summed over observed tokens
 struct layer_data_t {
-    // pairwise (vs previous layer / input embedding)
+    // stats against previous layer
     double sum_cos_sim = 0.0; // sum of cos(h_N, h_{N-1}) per token
     double sum_l2_dist = 0.0; // sum of ||h_N - h_{N-1}||_2 per token
 
-    // self (vs zero)
+    // stats of this layer
     double sum_l2_norm = 0.0; // sum of ||h_N||_2 per token
     double sum_l1_norm = 0.0; // sum of ||h_N||_1 per token
     double sum_inf_norm = 0.0; // sum of ||h_N||_inf per token
@@ -47,7 +45,7 @@ struct cb_data_t {
     std::map<int, std::vector<float>> prev;
 
     // TODO: measure against model input?
-    bool have_input = false;
+    // bool have_input = false;
 };
 
 static float cos_sim(const float * a, const float * b, int64_t n) {
@@ -98,17 +96,57 @@ static float inf_norm(const float * x, int64_t n) {
     return static_cast<float>(s);
 }
 
-// tensor data helper
-static const float * tensor_get_f32(const ggml_tensor * t, std::vector<float> & scratch) {
-    const size_t nbytes = ggml_nbytes(t);
+// helper struct to access tensor data regardless of backend
+struct tensor_data_view {
+    tensor_data_view(void * ptr) : ptr_(ptr), buf_({}) {}
+    tensor_data_view(std::vector<uint8_t>&& buf) : ptr_(buf.data()), buf_(std::move(buf)) {}
+    inline void * data() const { return ptr_; } // return a pointer to the tensor data
+    private:
+        void * ptr_;
+        std::vector<uint8_t> buf_;
+};
 
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        return static_cast<const float *>(t->data);
+// helper function to access tensor data regardless of backend
+static tensor_data_view tensor_get_view(const ggml_tensor * t) {
+    if (ggml_backend_buffer_is_host(t->buffer)) { // XXX: is this really correct?
+        return tensor_data_view(t->data);
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    std::vector<uint8_t> buf(nbytes);
+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+    return tensor_data_view(std::move(buf));
+}
+
+static std::vector<float> tensor_get_data_f32(const ggml_tensor * t) {
+    GGML_ASSERT(t != nullptr);
+
+    const int64_t n_elem = ggml_nelements(t);
+    std::vector<float> out(n_elem);
+
+    const tensor_data_view view = tensor_get_view(t);
+    const void * t_data = view.data();
+
+    switch (t->type) {
+        case GGML_TYPE_F32: {
+            const float * src = static_cast<const float *>(t_data);
+            std::copy(src, src + n_elem, out.begin());
+        } break;
+        case GGML_TYPE_F16: {
+            const ggml_fp16_t * src = static_cast<const ggml_fp16_t *>(t_data);
+            for (int64_t i = 0; i < n_elem; ++i) {
+                out[i] = ggml_fp16_to_fp32(src[i]);
+            }
+        } break;
+        case GGML_TYPE_BF16: {
+            const ggml_bf16_t * src = static_cast<const ggml_bf16_t *>(t_data);
+            for (int64_t i = 0; i < n_elem; ++i) {
+                out[i] = ggml_bf16_to_fp32(src[i]);
+            }
+        } break;
+        default: GGML_ABORT("%s: unhandled tensor type %s", __func__, ggml_type_name(t->type));
     }
 
-    scratch.resize(nbytes / sizeof(float));
-    ggml_backend_tensor_get(t, scratch.data(), 0, nbytes);
-    return scratch.data();
+    return out;
 }
 
 // filter: only ask for the layer-output node.
@@ -167,8 +205,11 @@ static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const int64_t n_embd   = t->ne[0];
     const int64_t n_tokens = t->ne[1];
 
-    std::vector<float> scratch;
-    const float * data = tensor_get_f32(t, scratch);
+    const std::vector<float> data_vec = tensor_get_data_f32(t);
+    if (data_vec.empty()) {
+        return true;
+    }
+    const float * data = data_vec.data();
 
     auto & st = state->stats[layer];
 
@@ -199,7 +240,7 @@ static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
         st.n_tokens++;
     }
 
-    state->prev[layer].assign(data, data + n_embd * n_tokens);
+    state->prev[layer].assign(data_vec.begin(), data_vec.end());
 
     return true;
 }
@@ -263,16 +304,29 @@ static void print_report(const cb_data_t & state) {
 static void run_layer_stats(llama_context * ctx, const common_params & params) {
     LOG_INF("%s: tokenizing the input ..\n", __func__);
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
-
     if (tokens.empty()) {
         LOG_ERR("%s: no tokens produced from prompt\n", __func__);
         return;
     }
 
-    const int n_ctx = static_cast<int>(tokens.size());
+    const int n_batch = static_cast<int>(llama_n_batch(ctx));
+    if (static_cast<int>(tokens.size()) > n_batch) {
+        LOG_WRN("%s: truncating prompt from %zu to %d tokens\n",
+                __func__, tokens.size(), n_batch);
+        tokens.resize(n_batch);
+    }
 
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
-    // TODO: fill batch correctly
+    const int n_tokens = static_cast<int>(tokens.size());
+
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (int i = 0; i < n_tokens; ++i) {
+        batch.token[i]    = tokens[i];
+        batch.pos[i]      = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]   = false;
+    }
+    batch.n_tokens = n_tokens;
 
     LOG_INF("%s: decoding %d tokens ...\n", __func__, batch.n_tokens);
     if (llama_decode(ctx, batch) != 0) {

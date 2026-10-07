@@ -2,7 +2,7 @@
  *
  * llama-layer-stats
  *
- * TODO: support `l_last` for mHC models
+ * TODO: support `l_last` for mHC models (3D hidden states)
 **/
 
 #include "arg.h"
@@ -20,18 +20,12 @@
 #include <string>
 #include <vector>
 
-// global CLI option
-//   0 = rank by L2 distance to previous layer, descending (most change first)
-//   1 = rank by cosine similarity to previous layer, ascending (most change first)
-static int g_rank_metric = 0;
-
-// Welford's online algorithm for running mean / variance.
-// Tracks per-token observations of a scalar metric; variance is over all
-// observed tokens.
+// Welford's online algorithm for running mean and variance
+// ref: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
 struct running_stats_t {
-    int64_t n    = 0;     // number of observations
-    double  mean = 0.0;   // running mean
-    double  m2   = 0.0;   // sum of squared deviations from the running mean
+    int64_t n    = 0;   // number of observations
+    double  mean = 0.0; // running mean
+    double  m2   = 0.0; // sum of squared deviations from the running mean
 
     void update(double x) {
         n++;
@@ -40,32 +34,27 @@ struct running_stats_t {
         m2   += delta * (x - mean);
     }
 
-    // sample variance (n-1). returns 0 if fewer than 2 samples.
     double variance() const { return n > 1 ? m2 / (n - 1) : 0.0; }
     double stddev()   const { return std::sqrt(variance()); }
 };
 
-// per-layer accumulated statistics
+// per-layer statistics, accumulated per token
 struct layer_data_t {
-    // stats against previous layer
-    running_stats_t cos_sim;  // cos(h_N, h_{N-1}) per token
-    running_stats_t l2_dist;  // ||h_N - h_{N-1}||_2 per token
+    // these compare to previous layer
+    running_stats_t cos_sim;  // cos(h_N, h_{N-1})
+    running_stats_t l2_dist;  // ||h_N - h_{N-1}||_2
 
-    // stats of this layer
-    running_stats_t l2_norm;  // ||h_N||_2 per token
-    running_stats_t l1_norm;  // ||h_N||_1 per token
-    running_stats_t inf_norm; // ||h_N||_inf per token
+    // these only consider the current layer
+    running_stats_t l2_norm;  // ||h_N||_2
+    running_stats_t l1_norm;  // ||h_N||_1
+    running_stats_t inf_norm; // ||h_N||_inf
 };
 
 struct cb_data_t {
-    int n_layer = 0; // number of layers in the model (for bounds / sanity checks)
-
-    // per-layer running stats, indexed by layer number
-    std::map<int, layer_data_t> stats;
-
-    // previous layer's hidden state, per token: prev[layer] holds h_{layer-1}
-    // laid out as [n_embd] contiguous floats per token
-    std::map<int, std::vector<float>> prev;
+    int n_layer = 0;
+    std::map<int, layer_data_t> stats;      // per-layer running stats, indexed by layer number
+    std::map<int, std::vector<float>> prev; // prev. layer hidden state: prev[layer] -> h_{layer-1}
+                                            // laid out as [n_embd] contiguous floats per token
 };
 
 static float cos_sim(const float * a, const float * b, int64_t n) {
@@ -169,7 +158,7 @@ static std::vector<float> tensor_get_data_f32(const ggml_tensor * t) {
 }
 
 // filter: only ask for the layer-output node.
-// TODO: extend match set to "l_last" to support mHC models
+// TODO: extend match set to "l_last" to support mHC models (3D hidden states)
 static bool is_layer_output(const ggml_tensor * t) {
     if (t == nullptr || t->name[0] == '\0') {
         return false;
@@ -196,7 +185,7 @@ static int parse_layer_index(const ggml_tensor * t) {
     return static_cast<int>(il);
 }
 
-static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
+static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * state = static_cast<cb_data_t *>(user_data);
 
     if (ask) {
@@ -217,7 +206,7 @@ static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const int64_t n_embd   = t->ne[0];
     const int64_t n_tokens = t->ne[1];
 
-    // non-const so we can move it into `prev` at the end (avoids a full copy)
+    // non-const so we can move it into `prev` at the end (avoid full copy)
     std::vector<float> data_vec = tensor_get_data_f32(t);
     if (data_vec.empty()) {
         return true;
@@ -229,15 +218,12 @@ static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const float * h = data + tok * n_embd;
 
-        // self metrics (always computable)
+        // basic stats
         st.l2_norm .update(l2_norm (h, n_embd));
         st.l1_norm .update(l1_norm (h, n_embd));
         st.inf_norm.update(inf_norm(h, n_embd));
 
-        // pairwise metrics (need the previous layer's vector for this token).
-        // NOTE: within one llama_decode() the layers run in topological order,
-        // so prev[layer-1] always holds the current batch's data by the time
-        // we get here.
+        // pairwise metrics (against previous layer for the same token)
         const float * prev = nullptr;
         if (layer > 0) {
             auto it = state->prev.find(layer - 1);
@@ -263,6 +249,11 @@ static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
 // reporting
 //
 
+// global CLI option
+//   0 = rank by L2 distance to previous layer, descending (most change first)
+//   1 = rank by cosine similarity to previous layer, ascending (most change first)
+static int g_rank_metric = 0;
+
 struct layer_row {
     int    layer;
     double cos_sim,    cos_sim_std;
@@ -272,7 +263,7 @@ struct layer_row {
     double linf,       linf_std;
 };
 
-// center `text` (assumed ASCII) over `w` bytes; pads with spaces
+// center `text` (assumed ASCII) over `w` bytes; pad with spaces
 static void print_centered(const char * text, int w) {
     const int len = (int)strlen(text);
     const int pad = std::max(0, w - len);
@@ -312,42 +303,32 @@ static void print_report(const cb_data_t & state) {
         });
     }
 
-    // --- column geometry -----------------------------------------------------
-    //
-    // Each metric cell is built as:  <mean> <space><±><space> <std>
-    //
-    //   W_MEAN = 8   -> %8.3f fits up to "9999.999" (room for 2313.284)
-    //   W_STD  = 6   -> %6.2f  fits up to  "999.99" (room for  490.72)
-    //                   and guarantees at least 2 whole-number digits of pad
-    //   " ± "        -> 4 bytes in UTF-8 (space=1, ±=2, space=1)
-    //
-    const int W_RANK  = 4;
-    const int W_LAYER = 5;
-    const int W_MEAN  = 8;
-    const int W_STD   = 6;
-    const int W_SEP   = 4;                              // " ± " as UTF-8
-    const int W_MET   = W_MEAN + W_SEP + W_STD;         // = 18 bytes/cell
+    // column widths
+    const int W_RANK   = 4;
+    const int W_LAYER  = 5;
+    const int W_MEAN   = 9;
+    const int W_STD    = 7;
+    const int W_SEP    = 4; // " ± "
+    const int W_METRIC = W_MEAN + W_SEP + W_STD;
 
-    // --- header (leading space on the line) --------------------------------
+    // header
     printf("\n\n %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
-    print_centered("cossim",        W_MET); printf("  ");
-    print_centered("L2 norm dist.", W_MET); printf("  ");
-    print_centered("L2 norm",       W_MET); printf("  ");
-    print_centered("L1 norm",       W_MET); printf("  ");
-    print_centered("L-inf norm",    W_MET);
+    print_centered("cossim",        W_METRIC); printf("  ");
+    print_centered("L2 norm dist.", W_METRIC); printf("  ");
+    print_centered("L2 norm",       W_METRIC); printf("  ");
+    print_centered("L1 norm",       W_METRIC); printf("  ");
+    print_centered("L-inf norm",    W_METRIC);
     printf("\n");
 
-    // --- rule ---------------------------------------------------------------
-    // 1 (leading space) + rank + 2 + layer + 2 + 5 cells + 4 inter-cell gaps
-    const int total_w = 1 + W_RANK + 2 + W_LAYER + 2 + 5 * W_MET + 4 * 2;
+    // rule
+    const int total_w = 1 + W_RANK + 2 + W_LAYER + 2 + 5 * W_METRIC + 4 * 2;
     printf(" %s\n", std::string(total_w - 1, '=').c_str());
 
-    // --- data rows (leading space on each line) ----------------------------
+    // data rows
     int rank = 1;
     for (const auto & r : rows) {
         char cos_buf [64], l2d_buf[64], l2_buf[64], l1_buf[64], linf_buf[64];
 
-        // %*.*f -> width, precision taken from args; gives fixed byte width
         std::snprintf(cos_buf,  sizeof(cos_buf),
             "%*.*f ± %*.*f", W_MEAN, 3, r.cos_sim,  W_STD, 2, r.cos_sim_std);
         std::snprintf(l2d_buf,  sizeof(l2d_buf),
@@ -372,7 +353,7 @@ static void print_report(const cb_data_t & state) {
 //
 
 static void run_layer_stats(llama_context * ctx, const common_params & params) {
-    LOG_INF("%s: tokenizing the input ..\n", __func__);
+    LOG_INF("%s: tokenizing the input ...\n", __func__);
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
     if (tokens.empty()) {
         LOG_ERR("%s: no tokens produced from prompt\n", __func__);
@@ -382,9 +363,9 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
     const int n_ctx   = static_cast<int>(llama_n_ctx(ctx));
     const int n_batch = static_cast<int>(llama_n_batch(ctx));
 
-    // truncate to n_ctx (NOT n_batch) -- we'll iterate over batches below
+    // truncate to n_ctx
     if (static_cast<int>(tokens.size()) > n_ctx) {
-        LOG_WRN("%s: truncating prompt from %zu to %d tokens (n_ctx)\n",
+        LOG_WRN("%s: truncating the input from %zu to n_ctx == %d tokens\n",
                 __func__, tokens.size(), n_ctx);
         tokens.resize(n_ctx);
     }
@@ -392,8 +373,8 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
     const int n_tokens  = static_cast<int>(tokens.size());
     const int n_batches = (n_tokens + n_batch - 1) / n_batch;
 
-    LOG_INF("%s: decoding %d tokens in %d batch(es) of up to %d tokens\n",
-            __func__, n_tokens, n_batches, n_batch);
+    LOG_INF("%s: decoding %d tokens in %d %s of up to %d tokens\n",
+            __func__, n_tokens, n_batches, n_batches == 1 ? "batch" : "batches", n_batch);
 
     for (int b = 0; b < n_batches; ++b) {
         const int start = b * n_batch;
@@ -409,8 +390,7 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
         }
         batch.n_tokens = n;
 
-        LOG_INF("%s: batch %d/%d: %d tokens (positions %d..%d)\n",
-                __func__, b + 1, n_batches, n, start, start + n - 1);
+        LOG_INF("%s: batch %d/%d: %d tokens\n", __func__, b + 1, n_batches, n);
 
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: llama_decode failed on batch %d\n", __func__, b + 1);
@@ -423,46 +403,46 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
 }
 
 static void print_usage(int /*argc*/, char ** /*argv*/) {
-    printf("\nllama-layer-stats: per-layer hidden-state statistics\n\n");
-    printf("Additional options (beyond common llama.cpp options):\n");
-    printf("  --rank-by <metric>   metric used to rank layers in the report\n");
-    printf("                       l2dist  - L2 distance to previous layer (default)\n");
-    printf("                       cossim  - cosine similarity to previous layer\n\n");
+    // printf("\nllama-layer-stats: per-layer hidden-state statistics\n\n");
+    // printf("additional options (beyond common llama.cpp options):\n");
+    // printf("  --rank-by <metric>   metric used to rank layers in the report\n");
+    // printf("                       l2dist  - L2 distance to previous layer (default)\n");
+    // printf("                       cossim  - cosine similarity to previous layer\n\n");
 }
 
 // Pre-scan argv, extract `--rank-by <value>`, and remove it from argv so
 // common_params_parse() doesn't reject it as an unknown flag.
-static void strip_rank_metric_arg(int & argc, char ** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--rank-by") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "error: --rank-by requires an argument (l2dist or cossim)\n");
-                exit(1);
-            }
-            if (strcmp(argv[i + 1], "l2dist") == 0) {
-                g_rank_metric = 0;
-            } else if (strcmp(argv[i + 1], "cossim") == 0) {
-                g_rank_metric = 1;
-            } else {
-                fprintf(stderr, "error: unknown --rank-by value '%s' (use l2dist or cossim)\n",
-                        argv[i + 1]);
-                exit(1);
-            }
-            // shift remaining args left by 2
-            for (int j = i; j + 2 < argc; ++j) {
-                argv[j] = argv[j + 2];
-            }
-            argc -= 2;
-            i--; // re-check the same index
-        }
-    }
-}
+// static void strip_rank_metric_arg(int & argc, char ** argv) {
+//     for (int i = 1; i < argc; ++i) {
+//         if (strcmp(argv[i], "--rank-by") == 0) {
+//             if (i + 1 >= argc) {
+//                 fprintf(stderr, "error: --rank-by requires an argument (l2dist or cossim)\n");
+//                 exit(1);
+//             }
+//             if (strcmp(argv[i + 1], "l2dist") == 0) {
+//                 g_rank_metric = 0;
+//             } else if (strcmp(argv[i + 1], "cossim") == 0) {
+//                 g_rank_metric = 1;
+//             } else {
+//                 fprintf(stderr, "error: unknown --rank-by value '%s' (use l2dist or cossim)\n",
+//                         argv[i + 1]);
+//                 exit(1);
+//             }
+//             // shift remaining args left by 2
+//             for (int j = i; j + 2 < argc; ++j) {
+//                 argv[j] = argv[j + 2];
+//             }
+//             argc -= 2;
+//             i--; // re-check the same index
+//         }
+//     }
+// }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     // must happen before common_params_parse()
-    strip_rank_metric_arg(argc, argv);
+    // strip_rank_metric_arg(argc, argv);
 
     common_init();
 
@@ -480,7 +460,7 @@ int main(int argc, char ** argv) {
 
     cb_data_t state;
 
-    params.cb_eval = cb;
+    params.cb_eval = cb_func;
     params.cb_eval_user_data = &state;
 
     llama_backend_init();

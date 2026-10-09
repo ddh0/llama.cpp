@@ -1,6 +1,6 @@
 /**
  *
- * llama-layer-stats
+ * llama-layer-stats -- record per-layer hidden-state statistics captured via eval callback
  *
  * TODO: support `l_last` for mHC models (3-dimensional hidden states)
 **/
@@ -19,6 +19,12 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// --rank-by CLI options
+//
+//   0 = rank by L2 distance to previous layer, descending (most change first)
+//   1 = rank by cosine similarity to previous layer, ascending (most change first) (default)
+static int g_rank_metric = 1;
 
 // Welford's online algorithm for running mean and variance
 // ref: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
@@ -51,7 +57,9 @@ struct layer_data_t {
 };
 
 struct cb_data_t {
-    int n_layer = 0;
+    int n_layer = 0;                        // current layer idx
+    int n_tokens = 0;                       // # of tokens seen
+    size_t n_bytes = 0;                     // total size of all observed hidden states, in bytes
     std::map<int, layer_data_t> stats;      // per-layer running stats, indexed by layer number
     std::map<int, std::vector<float>> prev; // prev. layer hidden state: prev[layer] -> h_{layer-1}
                                             // laid out as [n_embd] contiguous floats per token
@@ -110,9 +118,9 @@ struct tensor_data_view {
     tensor_data_view(void * ptr) : ptr_(ptr), buf_({}) {}
     tensor_data_view(std::vector<uint8_t>&& buf) : ptr_(buf.data()), buf_(std::move(buf)) {}
     inline void * data() const { return ptr_; }
-    private:
-        void * ptr_;
-        std::vector<uint8_t> buf_;
+private:
+    void * ptr_;
+    std::vector<uint8_t> buf_;
 };
 
 static tensor_data_view tensor_get_view(const ggml_tensor * t) {
@@ -186,7 +194,7 @@ static int tensor_get_layer_idx(const ggml_tensor * t) {
 }
 
 static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
-    auto * state = static_cast<cb_data_t *>(user_data);
+    auto * data = static_cast<cb_data_t *>(user_data);
 
     if (ask) {
         return is_layer_output(t);
@@ -197,8 +205,8 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
         LOG_ERR("%s: could not parse layer index from tensor name '%s'\n", __func__, t->name);
         return true;
     }
-    if (state->n_layer > 0 && il >= state->n_layer) {
-        LOG_ERR("%s: layer index %d out of range (n_layer=%d)\n", __func__, il, state->n_layer);
+    if (data->n_layer > 0 && il >= data->n_layer) {
+        LOG_ERR("%s: layer index %d out of range (n_layer=%d)\n", __func__, il, data->n_layer);
         return true;
     }
 
@@ -207,16 +215,18 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
     const int64_t n_tokens = t->ne[1];
 
     // non-const, avoid full copy
-    std::vector<float> data_vec = tensor_get_data_f32(t);
-    if (data_vec.empty()) {
+    std::vector<float> hidden_vec_f32 = tensor_get_data_f32(t);
+    if (hidden_vec_f32.empty()) {
         return true;
     }
-    const float * data = data_vec.data();
+    const float * hidden_f32 = hidden_vec_f32.data();
 
-    auto & st = state->stats[il];
+    data->n_bytes += n_embd * n_tokens * sizeof(float);
+
+    auto & st = data->stats[il];
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
-        const float * h = data + tok * n_embd;
+        const float * h = hidden_f32 + tok * n_embd;
 
         // basic stats
         st.l2_norm .update(l2_norm (h, n_embd));
@@ -226,8 +236,8 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
         // pairwise metrics (against previous layer for the same token)
         const float * prev = nullptr;
         if (il > 0) {
-            auto it = state->prev.find(il - 1);
-            if (it != state->prev.end() &&
+            auto it = data->prev.find(il - 1);
+            if (it != data->prev.end() &&
                 static_cast<int64_t>(it->second.size()) == n_embd * n_tokens) {
                 prev = it->second.data() + tok * n_embd;
             }
@@ -240,7 +250,7 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // move, don't copy
-    state->prev[il] = std::move(data_vec);
+    data->prev[il] = std::move(hidden_vec_f32);
 
     return true;
 }
@@ -248,11 +258,6 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
 //
 // reporting
 //
-
-// global CLI option
-//   0 = rank by L2 distance to previous layer, descending (most change first)
-//   1 = rank by cosine similarity to previous layer, ascending (most change first)
-static int g_rank_metric = 0;
 
 // global CLI option: path to write per-layer stats as CSV (empty = no export)
 static std::string g_output_csv_path;
@@ -277,10 +282,10 @@ static void print_centered(const char * text, int w) {
     for (int i = 0; i < right; ++i) putchar(' ');
 }
 
-static void print_report(const cb_data_t & state) {
+static void print_report(const cb_data_t & data) {
     std::vector<layer_row> rows;
 
-    for (const auto & kv : state.stats) {
+    for (const auto & kv : data.stats) {
         const int layer = kv.first;
         const auto & s  = kv.second;
         if (s.l2_norm.n <= 0) {
@@ -315,6 +320,7 @@ static void print_report(const cb_data_t & state) {
     const int W_METRIC = W_MEAN + W_SEP + W_STD;
 
     // header
+    fflush(stdout); // needed to avoid interleaving output lines
     printf("\n\n %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
     print_centered("cossim",        W_METRIC); printf("  ");
     print_centered("L2 norm dist.", W_METRIC); printf("  ");
@@ -348,7 +354,12 @@ static void print_report(const cb_data_t & state) {
                W_LAYER, r.layer,
                cos_buf, l2d_buf, l2_buf, l1_buf, linf_buf);
     }
+
     printf("\n");
+    fflush(stdout); // needed to avoid interleaving output lines
+
+    LOG_INF("%s: computed over %d tokens, %d layers\n", __func__, data.n_tokens, data.n_layer);
+    LOG_INF("%s: total hidden state data captured: %.2f MiB\n", __func__, data.n_bytes/1024.0/1024.0);
 }
 
 // write per-layer stats to a CSV file for the web UI.
@@ -398,16 +409,13 @@ static bool write_csv(const cb_data_t & state, const std::string & path) {
     return true;
 }
 
-//
-// driver
-//
-
-static void run_layer_stats(llama_context * ctx, const common_params & params) {
+// eval the input, return true on success, false on failure
+static bool run_layer_stats(llama_context * ctx, const common_params & params, cb_data_t & data) {
     LOG_INF("%s: tokenizing the input ...\n", __func__);
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
     if (tokens.empty()) {
-        LOG_ERR("%s: no tokens produced from prompt\n", __func__);
-        return;
+        LOG_ERR("%s: input is empty!\n", __func__);
+        return false;
     }
 
     const int n_ctx   = static_cast<int>(llama_n_ctx(ctx));
@@ -420,11 +428,12 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
         tokens.resize(n_ctx);
     }
 
-    const int n_tokens  = static_cast<int>(tokens.size());
+    const int n_tokens = static_cast<int>(tokens.size());
     const int n_batches = (n_tokens + n_batch - 1) / n_batch;
+    data.n_tokens = n_tokens;
 
-    LOG_INF("%s: decoding %d tokens in %d %s of up to %d tokens\n",
-            __func__, n_tokens, n_batches, n_batches == 1 ? "batch" : "batches", n_batch);
+    LOG_INF("%s: decoding %d tokens in %d %s\n",
+            __func__, n_tokens, n_batches, n_batches == 1 ? "batch" : "batches");
 
     for (int b = 0; b < n_batches; ++b) {
         const int start = b * n_batch;
@@ -436,28 +445,31 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
             batch.pos[i]       = start + i;
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i]    = false;
+            batch.logits[i]    = true; // ensure crop_before_nextn() -> false
         }
         batch.n_tokens = n;
 
-        LOG_INF("%s: batch %d/%d: %d tokens\n", __func__, b + 1, n_batches, n);
+        LOG_INF("%s: batch %d/%d: decoding %d tokens ...\n", __func__, b + 1, n_batches, n);
 
-        if (llama_decode(ctx, batch) != 0) {
-            LOG_ERR("%s: llama_decode failed on batch %d\n", __func__, b + 1);
+        auto ret = llama_decode(ctx, batch);
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode failed on batch %d (code %d)\n", __func__, b + 1, ret);
             llama_batch_free(batch);
-            return;
+            return false;
         }
 
         llama_batch_free(batch);
     }
+
+    return true;
 }
 
 static void print_usage(int /*argc*/, char ** /*argv*/) {
-    printf("\nllama-layer-stats: report per-layer hidden-state statistics captured via eval callback\n\n");
+    printf("\nllama-layer-stats: record per-layer hidden-state statistics captured via eval callback\n\n");
     printf("options:\n\n");
     printf("  --rank-by <metric>   metric used to rank layers in the report\n");
-    printf("                       l2dist  - L2 distance to previous layer (default)\n");
-    printf("                       cossim  - cosine similarity to previous layer\n");
+    printf("                       l2dist  - L2 distance to previous layer\n");
+    printf("                       cossim  - cosine similarity to previous layer (default)\n");
     printf("  --output-csv <path>  write per-layer stats to a CSV file\n");
     printf("                       (columns: layer, c_prev, d_prev, ...)\n\n");
 }
@@ -501,7 +513,7 @@ static void strip_custom_args(int & argc, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
+    std::setlocale(LC_NUMERIC, "C"); // ref: https://github.com/ggml-org/llama.cpp/pull/17331
 
     // must happen before common_params_parse() // TODO: properly integrate into common args
     strip_custom_args(argc, argv);
@@ -509,21 +521,27 @@ int main(int argc, char ** argv) {
     common_init();
 
     common_params params;
-    params.warmup = false; // avoid capturing an empty warmup pass
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LAYER_STATS, print_usage)) {
         return 1;
     }
-
     if (params.prompt.empty()) {
-        LOG_ERR("no prompt provided: please specify -p / --prompt OR -f / --file\n");
+        LOG_ERR("no input provided; please specify -p / --prompt OR -f / --file\n");
         return 1;
     }
+    if (params.warmup) {
+        LOG_WRN("override: set warmup = false\n");
+        params.warmup = false; // avoid capturing an empty warmup pass
+    }
+    if (params.n_parallel > 1) {
+        LOG_WRN("override: set n_parallel = 1\n");
+        params.n_parallel = 1; // NOTE: only support one sequence for now
+    }
 
-    cb_data_t state;
+    cb_data_t cb_data;
 
     params.cb_eval = cb_func;
-    params.cb_eval_user_data = &state;
+    params.cb_eval_user_data = &cb_data;
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -532,19 +550,24 @@ int main(int argc, char ** argv) {
     auto * model = llama_init->model();
     auto * ctx   = llama_init->context();
 
-    if (model == nullptr || ctx == nullptr) {
-        LOG_ERR("%s: failed to init model/context\n", __func__);
+    if (model == nullptr) {
+        LOG_ERR("%s: failed to init llama_model\n", __func__);
         return 1;
     }
 
-    state.n_layer = llama_model_n_layer(model);
+    if (ctx == nullptr) {
+        LOG_ERR("%s: failed to init llama_context\n", __func__);
+        return 1;
+    }
 
-    run_layer_stats(ctx, params);
+    cb_data.n_layer = llama_model_n_layer(model);
 
-    print_report(state);
+    run_layer_stats(ctx, params, cb_data);
 
-    if (!write_csv(state, g_output_csv_path)) {
-        // non-fatal; but exit with non-zero so scripting can detect the failure
+    print_report(cb_data);
+
+    if (!write_csv(cb_data, g_output_csv_path)) {
+        LOG_ERR("%s: failed to write CSV\n", __func__);
         llama_backend_free();
         return 1;
     }

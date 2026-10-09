@@ -2,7 +2,7 @@
  *
  * llama-layer-stats
  *
- * TODO: support `l_last` for mHC models (3D hidden states)
+ * TODO: support `l_last` for mHC models (3-dimensional hidden states)
 **/
 
 #include "arg.h"
@@ -158,7 +158,7 @@ static std::vector<float> tensor_get_data_f32(const ggml_tensor * t) {
 }
 
 // filter: only ask for the layer-output node.
-// TODO: extend match set to "l_last" to support mHC models (3D hidden states)
+// TODO: extend for mHC
 static bool is_layer_output(const ggml_tensor * t) {
     if (t == nullptr || t->name[0] == '\0') {
         return false;
@@ -171,8 +171,8 @@ static bool is_layer_output(const ggml_tensor * t) {
     return t->name[plen] != '\0' && isdigit(static_cast<unsigned char>(t->name[plen]));
 }
 
-// parse the layer index out of a `l_out-<il>` node name.
-static int parse_layer_index(const ggml_tensor * t) {
+// get layer index from tensor name `l_out-<il>`
+static int tensor_get_layer_idx(const ggml_tensor * t) {
     const char * dash = strrchr(t->name, '-');
     if (dash == nullptr || dash == t->name) {
         return -1;
@@ -192,28 +192,28 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
         return is_layer_output(t);
     }
 
-    const int layer = parse_layer_index(t);
-    if (layer < 0) {
+    const int il = tensor_get_layer_idx(t);
+    if (il < 0) {
         LOG_ERR("%s: could not parse layer index from tensor name '%s'\n", __func__, t->name);
         return true;
     }
-    if (state->n_layer > 0 && layer >= state->n_layer) {
-        LOG_ERR("%s: layer index %d out of range (n_layer=%d)\n", __func__, layer, state->n_layer);
+    if (state->n_layer > 0 && il >= state->n_layer) {
+        LOG_ERR("%s: layer index %d out of range (n_layer=%d)\n", __func__, il, state->n_layer);
         return true;
     }
 
-    // `l_out` shape is [n_embd, n_tokens, ...]
+    // shape of `l_out` is [n_embd, n_tokens, <ne2>, <ne3>]
     const int64_t n_embd   = t->ne[0];
     const int64_t n_tokens = t->ne[1];
 
-    // non-const so we can move it into `prev` at the end (avoid full copy)
+    // non-const, avoid full copy
     std::vector<float> data_vec = tensor_get_data_f32(t);
     if (data_vec.empty()) {
         return true;
     }
     const float * data = data_vec.data();
 
-    auto & st = state->stats[layer];
+    auto & st = state->stats[il];
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const float * h = data + tok * n_embd;
@@ -225,8 +225,8 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
 
         // pairwise metrics (against previous layer for the same token)
         const float * prev = nullptr;
-        if (layer > 0) {
-            auto it = state->prev.find(layer - 1);
+        if (il > 0) {
+            auto it = state->prev.find(il - 1);
             if (it != state->prev.end() &&
                 static_cast<int64_t>(it->second.size()) == n_embd * n_tokens) {
                 prev = it->second.data() + tok * n_embd;
@@ -240,7 +240,7 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // move, don't copy
-    state->prev[layer] = std::move(data_vec);
+    state->prev[il] = std::move(data_vec);
 
     return true;
 }
@@ -253,6 +253,9 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
 //   0 = rank by L2 distance to previous layer, descending (most change first)
 //   1 = rank by cosine similarity to previous layer, ascending (most change first)
 static int g_rank_metric = 0;
+
+// global CLI option: path to write per-layer stats as CSV (empty = no export)
+static std::string g_output_csv_path;
 
 struct layer_row {
     int    layer;
@@ -348,6 +351,53 @@ static void print_report(const cb_data_t & state) {
     printf("\n");
 }
 
+// write per-layer stats to a CSV file for the web UI.
+// column names `c_prev` and `d_prev` match the webui's expected schema.
+static bool write_csv(const cb_data_t & state, const std::string & path) {
+    if (path.empty()) {
+        return true;
+    }
+
+    FILE * f = fopen(path.c_str(), "w");
+    if (f == nullptr) {
+        LOG_ERR("%s: failed to open '%s' for writing\n", __func__, path.c_str());
+        return false;
+    }
+
+    // header — first three columns match the webui; the rest are extras
+    fprintf(f, "layer,c_prev,cos_sim_std,d_prev,l2_dist_std,"
+               "l2_norm,l2_norm_std,l1_norm,l1_norm_std,inf_norm,inf_norm_std\n");
+
+    // iterate in layer order (not the ranked order used by print_report)
+    std::vector<int> layers;
+    layers.reserve(state.stats.size());
+    for (const auto & kv : state.stats) {
+        layers.push_back(kv.first);
+    }
+    std::sort(layers.begin(), layers.end());
+
+    int written = 0;
+    for (int layer : layers) {
+        const auto & s = state.stats.at(layer);
+        if (s.l2_norm.n <= 0) {
+            continue; // no observations for this layer (shouldn't happen, but be safe)
+        }
+        fprintf(f,
+            "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            layer,
+            s.cos_sim .mean, s.cos_sim .stddev(),
+            s.l2_dist .mean, s.l2_dist .stddev(),
+            s.l2_norm .mean, s.l2_norm .stddev(),
+            s.l1_norm .mean, s.l1_norm .stddev(),
+            s.inf_norm.mean, s.inf_norm.stddev());
+        written++;
+    }
+
+    fclose(f);
+    LOG_INF("%s: wrote %d layer rows to '%s'\n", __func__, written, path.c_str());
+    return true;
+}
+
 //
 // driver
 //
@@ -403,46 +453,58 @@ static void run_layer_stats(llama_context * ctx, const common_params & params) {
 }
 
 static void print_usage(int /*argc*/, char ** /*argv*/) {
-    // printf("\nllama-layer-stats: per-layer hidden-state statistics\n\n");
-    // printf("additional options (beyond common llama.cpp options):\n");
-    // printf("  --rank-by <metric>   metric used to rank layers in the report\n");
-    // printf("                       l2dist  - L2 distance to previous layer (default)\n");
-    // printf("                       cossim  - cosine similarity to previous layer\n\n");
+    printf("\nllama-layer-stats: report per-layer hidden-state statistics captured via eval callback\n\n");
+    printf("options:\n\n");
+    printf("  --rank-by <metric>   metric used to rank layers in the report\n");
+    printf("                       l2dist  - L2 distance to previous layer (default)\n");
+    printf("                       cossim  - cosine similarity to previous layer\n");
+    printf("  --output-csv <path>  write per-layer stats to a CSV file\n");
+    printf("                       (columns: layer, c_prev, d_prev, ...)\n\n");
 }
 
-// Pre-scan argv, extract `--rank-by <value>`, and remove it from argv so
-// common_params_parse() doesn't reject it as an unknown flag.
-// static void strip_rank_metric_arg(int & argc, char ** argv) {
-//     for (int i = 1; i < argc; ++i) {
-//         if (strcmp(argv[i], "--rank-by") == 0) {
-//             if (i + 1 >= argc) {
-//                 fprintf(stderr, "error: --rank-by requires an argument (l2dist or cossim)\n");
-//                 exit(1);
-//             }
-//             if (strcmp(argv[i + 1], "l2dist") == 0) {
-//                 g_rank_metric = 0;
-//             } else if (strcmp(argv[i + 1], "cossim") == 0) {
-//                 g_rank_metric = 1;
-//             } else {
-//                 fprintf(stderr, "error: unknown --rank-by value '%s' (use l2dist or cossim)\n",
-//                         argv[i + 1]);
-//                 exit(1);
-//             }
-//             // shift remaining args left by 2
-//             for (int j = i; j + 2 < argc; ++j) {
-//                 argv[j] = argv[j + 2];
-//             }
-//             argc -= 2;
-//             i--; // re-check the same index
-//         }
-//     }
-// }
+// pre-scan argv, extract custom flags (`--rank-by`, `--output-csv`), and remove
+// them from argv so common_params_parse() doesn't reject them as unknown flags.
+static void strip_custom_args(int & argc, char ** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--rank-by") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --rank-by requires an argument (l2dist or cossim)\n");
+                exit(1);
+            }
+            if (strcmp(argv[i + 1], "l2dist") == 0) {
+                g_rank_metric = 0;
+            } else if (strcmp(argv[i + 1], "cossim") == 0) {
+                g_rank_metric = 1;
+            } else {
+                fprintf(stderr, "error: unknown --rank-by value '%s' (use l2dist or cossim)\n",
+                        argv[i + 1]);
+                exit(1);
+            }
+            for (int j = i; j + 2 < argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            i--;
+        } else if (strcmp(argv[i], "--output-csv") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --output-csv requires an argument (path)\n");
+                exit(1);
+            }
+            g_output_csv_path = argv[i + 1];
+            for (int j = i; j + 2 < argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            i--;
+        }
+    }
+}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    // must happen before common_params_parse()
-    // strip_rank_metric_arg(argc, argv);
+    // must happen before common_params_parse() // TODO: properly integrate into common args
+    strip_custom_args(argc, argv);
 
     common_init();
 
@@ -480,6 +542,12 @@ int main(int argc, char ** argv) {
     run_layer_stats(ctx, params);
 
     print_report(state);
+
+    if (!write_csv(state, g_output_csv_path)) {
+        // non-fatal; but exit with non-zero so scripting can detect the failure
+        llama_backend_free();
+        return 1;
+    }
 
     llama_backend_free();
     return 0;

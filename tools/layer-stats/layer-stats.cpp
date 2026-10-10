@@ -1,6 +1,6 @@
 /**
  *
- * llama-layer-stats -- record per-layer hidden-state statistics captured via eval callback
+ * llama-layer-stats -- record per-layer hidden state statistics captured via eval callback
  *
  * TODO: support `l_last` for mHC models (3-dimensional hidden states)
 **/
@@ -9,6 +9,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -259,16 +260,12 @@ static bool cb_func(struct ggml_tensor * t, bool ask, void * user_data) {
 // reporting
 //
 
-// global CLI option: path to write per-layer stats as CSV (empty = no export)
-static std::string g_output_csv_path;
+// global CLI option: path to write per-layer stats as JSON (empty = no export)
+static std::string g_output_path;
 
 struct layer_row {
-    int    layer;
-    double cos_sim,    cos_sim_std;
-    double l2_dist,    l2_dist_std;
-    double l2,         l2_std;
-    double l1,         l1_std;
-    double linf,       linf_std;
+    int          layer;
+    layer_data_t stats;
 };
 
 // center `text` (assumed ASCII) over `w` bytes; pad with spaces
@@ -284,34 +281,27 @@ static void print_centered(const char * text, int w) {
 
 static void print_report(const cb_data_t & data) {
     std::vector<layer_row> rows;
+    std::vector<int>       empty_layers;
 
-    for (const auto & kv : data.stats) {
-        const int layer = kv.first;
-        const auto & s  = kv.second;
-        if (s.l2_norm.n <= 0) {
+    for (int layer = 0; layer < data.n_layer; ++layer) {
+        const auto it = data.stats.find(layer);
+        if (it == data.stats.end() || it->second.l2_norm.n <= 0) {
+            empty_layers.push_back(layer);
             continue;
         }
-        rows.push_back(layer_row{
-            layer,
-            s.cos_sim .mean, s.cos_sim .stddev(),
-            s.l2_dist .mean, s.l2_dist .stddev(),
-            s.l2_norm .mean, s.l2_norm .stddev(),
-            s.l1_norm .mean, s.l1_norm .stddev(),
-            s.inf_norm.mean, s.inf_norm.stddev(),
-        });
+        rows.push_back(layer_row{layer, it->second});
     }
 
     if (g_rank_metric == 1) {
         std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
-            return a.cos_sim < b.cos_sim;
+            return a.stats.cos_sim.mean < b.stats.cos_sim.mean;
         });
     } else {
         std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
-            return a.l2_dist > b.l2_dist;
+            return a.stats.l2_dist.mean > b.stats.l2_dist.mean;
         });
     }
 
-    // column widths
     const int W_RANK   = 4;
     const int W_LAYER  = 5;
     const int W_MEAN   = 9;
@@ -319,8 +309,17 @@ static void print_report(const cb_data_t & data) {
     const int W_SEP    = 4; // " ± "
     const int W_METRIC = W_MEAN + W_SEP + W_STD;
 
-    // header
-    fflush(stdout); // needed to avoid interleaving output lines
+    auto format_stat = [&](char * buf, size_t buflen, const running_stats_t & s) {
+        if (s.n <= 0) {
+            std::snprintf(buf, buflen, "%*s", W_METRIC, "n/a");
+        } else if (s.n <= 1) {
+            std::snprintf(buf, buflen, "%*.*f ± %*s", W_MEAN, 3, s.mean, W_STD, "n/a");
+        } else {
+            std::snprintf(buf, buflen, "%*.*f ± %*.*f", W_MEAN, 3, s.mean, W_STD, 2, s.stddev());
+        }
+    };
+
+    fflush(stdout);
     printf("\n\n %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
     print_centered("cossim",        W_METRIC); printf("  ");
     print_centered("L2 norm dist.", W_METRIC); printf("  ");
@@ -329,83 +328,89 @@ static void print_report(const cb_data_t & data) {
     print_centered("L-inf norm",    W_METRIC);
     printf("\n");
 
-    // rule
     const int total_w = 1 + W_RANK + 2 + W_LAYER + 2 + 5 * W_METRIC + 4 * 2;
     printf(" %s\n", std::string(total_w - 1, '=').c_str());
 
-    // data rows
+    auto emit = [&](const char * rank_str, int layer, const layer_data_t & s) {
+        char cos_buf[64], l2d_buf[64], l2_buf[64], l1_buf[64], linf_buf[64];
+        format_stat(cos_buf,  sizeof(cos_buf),  s.cos_sim);
+        format_stat(l2d_buf,  sizeof(l2d_buf),  s.l2_dist);
+        format_stat(l2_buf,   sizeof(l2_buf),   s.l2_norm);
+        format_stat(l1_buf,   sizeof(l1_buf),   s.l1_norm);
+        format_stat(linf_buf, sizeof(linf_buf), s.inf_norm);
+
+        printf(" %*s  %*d  %s  %s  %s  %s  %s\n",
+               W_RANK, rank_str, W_LAYER, layer,
+               cos_buf, l2d_buf, l2_buf, l1_buf, linf_buf);
+    };
+
     int rank = 1;
     for (const auto & r : rows) {
-        char cos_buf [64], l2d_buf[64], l2_buf[64], l1_buf[64], linf_buf[64];
+        char rank_buf[16];
+        std::snprintf(rank_buf, sizeof(rank_buf), "%d", rank++);
+        emit(rank_buf, r.layer, r.stats);
+    }
 
-        std::snprintf(cos_buf,  sizeof(cos_buf),
-            "%*.*f ± %*.*f", W_MEAN, 3, r.cos_sim,  W_STD, 2, r.cos_sim_std);
-        std::snprintf(l2d_buf,  sizeof(l2d_buf),
-            "%*.*f ± %*.*f", W_MEAN, 3, r.l2_dist,  W_STD, 2, r.l2_dist_std);
-        std::snprintf(l2_buf,   sizeof(l2_buf),
-            "%*.*f ± %*.*f", W_MEAN, 3, r.l2,       W_STD, 2, r.l2_std);
-        std::snprintf(l1_buf,   sizeof(l1_buf),
-            "%*.*f ± %*.*f", W_MEAN, 3, r.l1,       W_STD, 2, r.l1_std);
-        std::snprintf(linf_buf, sizeof(linf_buf),
-            "%*.*f ± %*.*f", W_MEAN, 3, r.linf,     W_STD, 2, r.linf_std);
-
-        printf(" %*d  %*d  %s  %s  %s  %s  %s\n",
-               W_RANK,  rank++,
-               W_LAYER, r.layer,
-               cos_buf, l2d_buf, l2_buf, l1_buf, linf_buf);
+    const layer_data_t empty;
+    for (int layer : empty_layers) {
+        emit("-", layer, empty);
     }
 
     printf("\n");
-    fflush(stdout); // needed to avoid interleaving output lines
+    fflush(stdout);
 
     LOG_INF("%s: computed over %d tokens, %d layers\n", __func__, data.n_tokens, data.n_layer);
     LOG_INF("%s: total hidden state data captured: %.2f MiB\n", __func__, data.n_bytes/1024.0/1024.0);
 }
 
-// write per-layer stats to a CSV file for the web UI.
-// column names `c_prev` and `d_prev` match the webui's expected schema.
-static bool write_csv(const cb_data_t & state, const std::string & path) {
+// mean (or stddev) of a running stat, or null when there is nothing to report
+static common_json_value stat_json(const running_stats_t & s, bool want_std) {
+    if (s.n <= 0 || (want_std && s.n <= 1)) {
+        return nullptr; // -> VAL_NULL
+    }
+    return want_std ? s.stddev() : s.mean;
+}
+
+// write per-layer stats to a JSON file
+static bool write_json(const cb_data_t & state, const std::string & path) {
     if (path.empty()) {
         return true;
     }
 
-    FILE * f = fopen(path.c_str(), "w");
+    common_json root = common_json::object();
+    root["layers"] = common_json::array();
+
+    const layer_data_t empty; // all running_stats_t have n == 0
+    for (int layer = 0; layer < state.n_layer; ++layer) {
+        const auto it = state.stats.find(layer);
+        const layer_data_t & s = (it != state.stats.end()) ? it->second : empty;
+
+        root["layers"].push_back({
+            {"layer",        layer},
+            {"c_prev",       stat_json(s.cos_sim,  false)},
+            {"cos_sim_std",  stat_json(s.cos_sim,  true)},
+            {"d_prev",       stat_json(s.l2_dist,  false)},
+            {"l2_dist_std",  stat_json(s.l2_dist,  true)},
+            {"l2_norm",      stat_json(s.l2_norm,  false)},
+            {"l2_norm_std",  stat_json(s.l2_norm,  true)},
+            {"l1_norm",      stat_json(s.l1_norm,  false)},
+            {"l1_norm_std",  stat_json(s.l1_norm,  true)},
+            {"inf_norm",     stat_json(s.inf_norm, false)},
+            {"inf_norm_std", stat_json(s.inf_norm, true)},
+        });
+    }
+
+    const std::string text = root.dump(2);
+
+    FILE * f = fopen(path.c_str(), "wb");
     if (f == nullptr) {
         LOG_ERR("%s: failed to open '%s' for writing\n", __func__, path.c_str());
         return false;
     }
-
-    // header — first three columns match the webui; the rest are extras
-    fprintf(f, "layer,c_prev,cos_sim_std,d_prev,l2_dist_std,"
-               "l2_norm,l2_norm_std,l1_norm,l1_norm_std,inf_norm,inf_norm_std\n");
-
-    // iterate in layer order (not the ranked order used by print_report)
-    std::vector<int> layers;
-    layers.reserve(state.stats.size());
-    for (const auto & kv : state.stats) {
-        layers.push_back(kv.first);
-    }
-    std::sort(layers.begin(), layers.end());
-
-    int written = 0;
-    for (int layer : layers) {
-        const auto & s = state.stats.at(layer);
-        if (s.l2_norm.n <= 0) {
-            continue; // no observations for this layer (shouldn't happen, but be safe)
-        }
-        fprintf(f,
-            "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-            layer,
-            s.cos_sim .mean, s.cos_sim .stddev(),
-            s.l2_dist .mean, s.l2_dist .stddev(),
-            s.l2_norm .mean, s.l2_norm .stddev(),
-            s.l1_norm .mean, s.l1_norm .stddev(),
-            s.inf_norm.mean, s.inf_norm.stddev());
-        written++;
-    }
-
+    fwrite(text.data(), 1, text.size(), f);
     fclose(f);
-    LOG_INF("%s: wrote %d layer rows to '%s'\n", __func__, written, path.c_str());
+
+    LOG_INF("%s: saved statistics to '%s'\n", __func__, path.c_str());
     return true;
 }
 
@@ -465,16 +470,15 @@ static bool run_layer_stats(llama_context * ctx, const common_params & params, c
 }
 
 static void print_usage(int /*argc*/, char ** /*argv*/) {
-    printf("\nllama-layer-stats: record per-layer hidden-state statistics captured via eval callback\n\n");
+    printf("\nllama-layer-stats: record per-layer hidden state statistics captured via eval callback\n\n");
     printf("options:\n\n");
-    printf("  --rank-by <metric>   metric used to rank layers in the report\n");
-    printf("                       l2dist  - L2 distance to previous layer\n");
-    printf("                       cossim  - cosine similarity to previous layer (default)\n");
-    printf("  --output-csv <path>  write per-layer stats to a CSV file\n");
-    printf("                       (columns: layer, c_prev, d_prev, ...)\n\n");
+    printf("  --rank-by METRIC     metric used to rank layers in the report. one of:\n");
+    printf("                         l2dist - L2 distance to previous layer\n");
+    printf("                         cossim - cosine similarity to previous layer (default)\n");
+    printf("  --output-json PATH   write per-layer stats to a JSON file\n\n");
 }
 
-// pre-scan argv, extract custom flags (`--rank-by`, `--output-csv`), and remove
+// pre-scan argv, extract custom flags (`--rank-by`, `--output-json`), and remove
 // them from argv so common_params_parse() doesn't reject them as unknown flags.
 static void strip_custom_args(int & argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
@@ -497,12 +501,12 @@ static void strip_custom_args(int & argc, char ** argv) {
             }
             argc -= 2;
             i--;
-        } else if (strcmp(argv[i], "--output-csv") == 0) {
+        } else if (strcmp(argv[i], "--output-json") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "error: --output-csv requires an argument (path)\n");
+                fprintf(stderr, "error: --output-json requires an argument (path)\n");
                 exit(1);
             }
-            g_output_csv_path = argv[i + 1];
+            g_output_path = argv[i + 1];
             for (int j = i; j + 2 < argc; ++j) {
                 argv[j] = argv[j + 2];
             }
@@ -529,14 +533,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("no input provided; please specify -p / --prompt OR -f / --file\n");
         return 1;
     }
-    if (params.warmup) {
-        LOG_WRN("override: set warmup = false\n");
-        params.warmup = false; // avoid capturing an empty warmup pass
-    }
-    if (params.n_parallel > 1) {
-        LOG_WRN("override: set n_parallel = 1\n");
-        params.n_parallel = 1; // NOTE: only support one sequence for now
-    }
 
     cb_data_t cb_data;
 
@@ -545,6 +541,15 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    if (params.warmup) {
+        LOG_WRN("override: set warmup = false\n");
+        params.warmup = false; // avoid capturing an empty warmup pass
+    }
+    if (params.n_parallel > 1) {
+        LOG_WRN("override: set n_parallel = 1\n");
+        params.n_parallel = 1; // NOTE: only support one sequence for now
+    }
 
     auto llama_init = common_init_from_params(params);
     auto * model = llama_init->model();
@@ -566,8 +571,8 @@ int main(int argc, char ** argv) {
 
     print_report(cb_data);
 
-    if (!write_csv(cb_data, g_output_csv_path)) {
-        LOG_ERR("%s: failed to write CSV\n", __func__);
+    if (!write_json(cb_data, g_output_path)) {
+        LOG_ERR("%s: failed to write JSON output\n", __func__);
         llama_backend_free();
         return 1;
     }

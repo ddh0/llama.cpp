@@ -311,25 +311,26 @@ static void print_report(const cb_data_t & data) {
 
     auto format_stat = [&](char * buf, size_t buflen, const running_stats_t & s) {
         if (s.n <= 0) {
-            std::snprintf(buf, buflen, "%*s", W_METRIC, "n/a");
+            std::snprintf(buf, buflen, "%*s", W_METRIC - 1, "no data    ");
         } else if (s.n <= 1) {
-            std::snprintf(buf, buflen, "%*.*f ± %*s", W_MEAN, 3, s.mean, W_STD, "n/a");
+            std::snprintf(buf, buflen, "%*.*f", W_MEAN, 3, s.mean);
         } else {
             std::snprintf(buf, buflen, "%*.*f ± %*.*f", W_MEAN, 3, s.mean, W_STD, 2, s.stddev());
         }
     };
 
     fflush(stdout);
-    printf("\n\n %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
-    print_centered("cossim",        W_METRIC); printf("  ");
-    print_centered("L2 norm dist.", W_METRIC); printf("  ");
-    print_centered("L2 norm",       W_METRIC); printf("  ");
-    print_centered("L1 norm",       W_METRIC); printf("  ");
-    print_centered("L-inf norm",    W_METRIC);
+    printf("\n\n  %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
+    print_centered("cossim",        W_METRIC - 1); printf("  ");
+    print_centered("L2 norm dist.", W_METRIC - 1); printf("  ");
+    print_centered("L2 norm",       W_METRIC - 1); printf("  ");
+    print_centered("L1 norm",       W_METRIC - 1); printf("  ");
+    print_centered("L-inf norm",    W_METRIC - 1);
     printf("\n");
 
-    const int total_w = 1 + W_RANK + 2 + W_LAYER + 2 + 5 * W_METRIC + 4 * 2;
-    printf(" %s\n", std::string(total_w - 1, '=').c_str());
+    // rule
+    const int total_w = 3 + W_RANK + 2 + W_LAYER + 2 + 5 * (W_METRIC - 1) + 4 * 2;
+    printf("%s\n", std::string(total_w, '=').c_str());
 
     auto emit = [&](const char * rank_str, int layer, const layer_data_t & s) {
         char cos_buf[64], l2d_buf[64], l2_buf[64], l1_buf[64], linf_buf[64];
@@ -356,7 +357,7 @@ static void print_report(const cb_data_t & data) {
         emit("-", layer, empty);
     }
 
-    printf("\n");
+    printf("\n\n");
     fflush(stdout);
 
     LOG_INF("%s: computed over %d tokens, %d layers\n", __func__, data.n_tokens, data.n_layer);

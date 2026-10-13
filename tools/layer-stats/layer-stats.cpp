@@ -17,6 +17,7 @@
 #include <cstring>
 #include <clocale>
 #include <cctype>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -24,8 +25,9 @@
 // --rank-by CLI options
 //
 //   0 = rank by L2 distance to previous layer, descending (most change first)
-//   1 = rank by cosine similarity to previous layer, ascending (most change first) (default)
-static int g_rank_metric = 1;
+//   1 = rank by cosine similarity to previous layer, ascending (most change first)
+//   2 = rank by composite importance score, descending (most important first) (default)
+static int g_rank_metric = 2;
 
 // Welford's online algorithm for running mean and variance
 // ref: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
@@ -266,7 +268,58 @@ static std::string g_output_path;
 struct layer_row {
     int          layer;
     layer_data_t stats;
+    double       score = -1.0; // composite importance score; -1 = not available
 };
+
+// compute normalized importance score, as a composition of cos_sim and l2_dist:
+//
+//   x = max(1 - norm(cos_sim) + eps, eps)  (high when cos_sim is low)
+//   y = max(    norm(l2_dist) + eps, eps)  (high when l2_dist is high)
+//
+//   score = x^a + x * y^(1 - a)
+//
+// where norm(v) = (v - min v) / (max v - min v) over all layers where both stats exist
+//
+static void compute_composite_scores(std::vector<layer_row> & rows) {
+    const double eps = 1e-5;
+    const double a   = 0.2;
+
+    double c_min =  std::numeric_limits<double>::max();
+    double c_max = -std::numeric_limits<double>::max();
+    double d_min =  std::numeric_limits<double>::max();
+    double d_max = -std::numeric_limits<double>::max();
+    int    n_valid = 0;
+
+    for (const auto & r : rows) {
+        if (r.stats.cos_sim.n <= 0 || r.stats.l2_dist.n <= 0) {
+            continue;
+        }
+        c_min = std::min(c_min, r.stats.cos_sim.mean);
+        c_max = std::max(c_max, r.stats.cos_sim.mean);
+        d_min = std::min(d_min, r.stats.l2_dist.mean);
+        d_max = std::max(d_max, r.stats.l2_dist.mean);
+        n_valid++;
+    }
+
+    if (n_valid == 0) {
+        return; // nothing to score
+    }
+
+    const double c_span = (c_max > c_min) ? (c_max - c_min) : 1.0;
+    const double d_span = (d_max > d_min) ? (d_max - d_min) : 1.0;
+
+    for (auto & r : rows) {
+        if (r.stats.cos_sim.n <= 0 || r.stats.l2_dist.n <= 0) {
+            r.score = -1.0;
+            continue;
+        }
+        const double cN = (r.stats.cos_sim.mean - c_min) / c_span; // 0..1
+        const double dN = (r.stats.l2_dist.mean - d_min) / d_span; // 0..1
+        const double x  = std::max(1.0 - cN + eps, eps);
+        const double y  = std::max(      dN + eps, eps);
+        r.score = std::pow(x, a) + x * std::pow(y, (1.0f - a));
+    }
+}
 
 // center `text` (assumed ASCII) over `w` bytes; pad with spaces
 static void print_centered(const char * text, int w) {
@@ -289,10 +342,16 @@ static void print_report(const cb_data_t & data) {
             empty_layers.push_back(layer);
             continue;
         }
-        rows.push_back(layer_row{layer, it->second});
+        rows.push_back(layer_row{layer, it->second, -1.0});
     }
 
-    if (g_rank_metric == 1) {
+    compute_composite_scores(rows);
+
+    if (g_rank_metric == 2) {
+        std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
+            return a.score > b.score; // most important first
+        });
+    } else if (g_rank_metric == 1) {
         std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
             return a.stats.cos_sim.mean < b.stats.cos_sim.mean;
         });
@@ -302,12 +361,13 @@ static void print_report(const cb_data_t & data) {
         });
     }
 
-    const int W_RANK   = 4;
-    const int W_LAYER  = 5;
-    const int W_MEAN   = 9;
-    const int W_STD    = 7;
-    const int W_SEP    = 4; // " ± "
-    const int W_METRIC = W_MEAN + W_SEP + W_STD;
+    const int W_RANK      = 4;
+    const int W_LAYER     = 5;
+    const int W_COMPOSITE = 12;
+    const int W_MEAN      = 9;
+    const int W_STD       = 7;
+    const int W_SEP       = 4; // " ± "
+    const int W_METRIC    = W_MEAN + W_SEP + W_STD;
 
     auto format_stat = [&](char * buf, size_t buflen, const running_stats_t & s) {
         if (s.n <= 0) {
@@ -321,27 +381,36 @@ static void print_report(const cb_data_t & data) {
 
     fflush(stdout);
     printf("\n\n  %*s  %*s  ", W_RANK, "rank", W_LAYER, "layer");
-    print_centered("cossim",        W_METRIC - 1); printf("  ");
-    print_centered("L2 norm dist.", W_METRIC - 1); printf("  ");
-    print_centered("L2 norm",       W_METRIC - 1); printf("  ");
-    print_centered("L1 norm",       W_METRIC - 1); printf("  ");
+    print_centered("composite",     W_COMPOSITE);   printf("  ");
+    print_centered("cossim",        W_METRIC - 1);  printf("  ");
+    print_centered("L2 norm dist.", W_METRIC - 1);  printf("  ");
+    print_centered("L2 norm",       W_METRIC - 1);  printf("  ");
+    print_centered("L1 norm",       W_METRIC - 1);  printf("  ");
     print_centered("L-inf norm",    W_METRIC - 1);
     printf("\n");
 
     // rule
-    const int total_w = 3 + W_RANK + 2 + W_LAYER + 2 + 5 * (W_METRIC - 1) + 4 * 2;
+    const int total_w = 3 + W_RANK + 2 + W_LAYER + 2 + W_COMPOSITE + 2
+                      + 5 * (W_METRIC - 1) + 4 * 2;
     printf("%s\n", std::string(total_w, '=').c_str());
 
-    auto emit = [&](const char * rank_str, int layer, const layer_data_t & s) {
+    auto emit = [&](const char * rank_str, int layer, const layer_data_t & s, double score) {
         char cos_buf[64], l2d_buf[64], l2_buf[64], l1_buf[64], linf_buf[64];
+        char score_buf[32];
         format_stat(cos_buf,  sizeof(cos_buf),  s.cos_sim);
         format_stat(l2d_buf,  sizeof(l2d_buf),  s.l2_dist);
         format_stat(l2_buf,   sizeof(l2_buf),   s.l2_norm);
         format_stat(l1_buf,   sizeof(l1_buf),   s.l1_norm);
         format_stat(linf_buf, sizeof(linf_buf), s.inf_norm);
+        if (score >= 0.0) {
+            std::snprintf(score_buf, sizeof(score_buf), "%*.*f", W_COMPOSITE, 4, score);
+        } else {
+            std::snprintf(score_buf, sizeof(score_buf), "%*s", W_COMPOSITE, "-");
+        }
 
-        printf(" %*s  %*d  %s  %s  %s  %s  %s\n",
+        printf(" %*s  %*d  %s  %s  %s  %s  %s  %s\n",
                W_RANK, rank_str, W_LAYER, layer,
+               score_buf,
                cos_buf, l2d_buf, l2_buf, l1_buf, linf_buf);
     };
 
@@ -349,12 +418,12 @@ static void print_report(const cb_data_t & data) {
     for (const auto & r : rows) {
         char rank_buf[16];
         std::snprintf(rank_buf, sizeof(rank_buf), "%d", rank++);
-        emit(rank_buf, r.layer, r.stats);
+        emit(rank_buf, r.layer, r.stats, r.score);
     }
 
     const layer_data_t empty;
     for (int layer : empty_layers) {
-        emit("-", layer, empty);
+        emit("-", layer, empty, -1.0);
     }
 
     printf("\n\n");
@@ -364,10 +433,10 @@ static void print_report(const cb_data_t & data) {
     LOG_INF("%s: total hidden state data captured: %.2f MiB\n", __func__, data.n_bytes/1024.0/1024.0);
 }
 
-// mean (or stddev) of a running stat, or null when there is nothing to report
+// mean or stddev of a running stat, or null
 static common_json_value stat_json(const running_stats_t & s, bool want_std) {
     if (s.n <= 0 || (want_std && s.n <= 1)) {
-        return nullptr; // -> VAL_NULL
+        return nullptr; // null
     }
     return want_std ? s.stddev() : s.mean;
 }
@@ -388,9 +457,9 @@ static bool write_json(const cb_data_t & state, const std::string & path) {
 
         root["layers"].push_back({
             {"layer",        layer},
-            {"c_prev",       stat_json(s.cos_sim,  false)},
+            {"cos_sim",      stat_json(s.cos_sim,  false)},
             {"cos_sim_std",  stat_json(s.cos_sim,  true)},
-            {"d_prev",       stat_json(s.l2_dist,  false)},
+            {"l2_dist",      stat_json(s.l2_dist,  false)},
             {"l2_dist_std",  stat_json(s.l2_dist,  true)},
             {"l2_norm",      stat_json(s.l2_norm,  false)},
             {"l2_norm_std",  stat_json(s.l2_norm,  true)},
@@ -474,8 +543,9 @@ static void print_usage(int /*argc*/, char ** /*argv*/) {
     printf("\nllama-layer-stats: record per-layer hidden state statistics captured via eval callback\n\n");
     printf("options:\n\n");
     printf("  --rank-by METRIC     metric used to rank layers in the report. one of:\n");
-    printf("                         l2dist - L2 distance to previous layer\n");
-    printf("                         cossim - cosine similarity to previous layer (default)\n");
+    printf("                         composite - combined cos_sim and l2_dist (default)\n");
+    printf("                         cos_sim   - cosine similarity to previous layer\n");
+    printf("                         l2_dist   - L2 distance to previous layer\n");
     printf("  --output-json PATH   write per-layer stats to a JSON file\n\n");
 }
 
@@ -485,15 +555,17 @@ static void strip_custom_args(int & argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--rank-by") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "error: --rank-by requires an argument (l2dist or cossim)\n");
+                fprintf(stderr, "error: --rank-by requires an argument (composite, l2_dist or cos_sim)\n");
                 exit(1);
             }
-            if (strcmp(argv[i + 1], "l2dist") == 0) {
+            if (strcmp(argv[i + 1], "composite") == 0) {
+                g_rank_metric = 2;
+            } else if (strcmp(argv[i + 1], "l2_dist") == 0) {
                 g_rank_metric = 0;
-            } else if (strcmp(argv[i + 1], "cossim") == 0) {
+            } else if (strcmp(argv[i + 1], "cos_sim") == 0) {
                 g_rank_metric = 1;
             } else {
-                fprintf(stderr, "error: unknown --rank-by value '%s' (use l2dist or cossim)\n",
+                fprintf(stderr, "error: unknown --rank-by value '%s' (use composite, l2_dist or cos_sim)\n",
                         argv[i + 1]);
                 exit(1);
             }

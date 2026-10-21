@@ -40,7 +40,7 @@ struct running_stats_t {
         n++;
         const double delta = x - mean;
         mean += delta / n;
-        m2   += delta * (x - mean);
+        m2   += delta * delta;
     }
 
     double variance() const { return n > 1 ? m2 / (n - 1) : 0.0; }
@@ -470,7 +470,7 @@ static bool write_json(const cb_data_t & state, const std::string & path) {
         });
     }
 
-    const std::string text = root.dump(2);
+    const std::string text = root.dump(4);
 
     FILE * f = fopen(path.c_str(), "wb");
     if (f == nullptr) {

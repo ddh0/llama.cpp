@@ -11,6 +11,7 @@
 #include "log.h"
 #include "json.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,11 @@
 //   1 = rank by cosine similarity to previous layer, ascending (most change first)
 //   2 = rank by composite importance score, descending (most important first) (default)
 static int g_rank_metric = 2;
+
+// --importance-mass-top / --importance-mass-bottom CLI options
+// fraction of the softmax(composite importance) mass to select from each end
+static double g_importance_mass_top    = 0.1;
+static double g_importance_mass_bottom = 0.1;
 
 // Welford's online algorithm for running mean and variance
 // ref: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
@@ -268,7 +274,8 @@ static std::string g_output_path;
 struct layer_row {
     int          layer;
     layer_data_t stats;
-    double       score = -1.0; // composite importance score; -1 = not available
+    double       score   = -1.0; // composite importance score; -1 = not available
+    double       softmax =  0.0; // softmax(score) over layers with a valid score
 };
 
 // compute normalized importance score, as a composition of cos_sim and l2_dist:
@@ -282,7 +289,7 @@ struct layer_row {
 //
 static void compute_composite_scores(std::vector<layer_row> & rows) {
     const double eps = 1e-5;
-    const double a   = 0.2;
+    const double a   = 0.5;
 
     double c_min =  std::numeric_limits<double>::max();
     double c_max = -std::numeric_limits<double>::max();
@@ -332,20 +339,108 @@ static void print_centered(const char * text, int w) {
     for (int i = 0; i < right; ++i) putchar(' ');
 }
 
-static void print_report(const cb_data_t & data) {
+// softmax over all layers that have a valid composite importance score
+static void compute_softmax(std::vector<layer_row> & rows) {
+    double max_score = -std::numeric_limits<double>::infinity();
+    for (const auto & r : rows) {
+        if (r.score >= 0.0) {
+            max_score = std::max(max_score, r.score);
+        }
+    }
+    if (!std::isfinite(max_score)) {
+        return; // no valid scores
+    }
+
+    double sum = 0.0;
+    for (auto & r : rows) {
+        if (r.score >= 0.0) {
+            r.softmax = std::exp(r.score - max_score);
+            sum += r.softmax;
+        }
+    }
+    if (sum <= 0.0) {
+        return;
+    }
+    for (auto & r : rows) {
+        if (r.score >= 0.0) {
+            r.softmax /= sum;
+        }
+    }
+}
+
+struct report_data_t {
     std::vector<layer_row> rows;
     std::vector<int>       empty_layers;
+};
 
+static report_data_t build_report_data(const cb_data_t & data) {
+    report_data_t rep;
     for (int layer = 0; layer < data.n_layer; ++layer) {
         const auto it = data.stats.find(layer);
         if (it == data.stats.end() || it->second.l2_norm.n <= 0) {
-            empty_layers.push_back(layer);
+            rep.empty_layers.push_back(layer);
             continue;
         }
-        rows.push_back(layer_row{layer, it->second, -1.0});
+        rep.rows.push_back(layer_row{layer, it->second, -1.0});
+    }
+    compute_composite_scores(rep.rows);
+    compute_softmax(rep.rows);
+    return rep;
+}
+
+// select layers from the most (from_top=true) or least (from_top=false) important end
+// until their cumulative softmax importance mass exceeds `mass`
+static std::vector<int> select_importance_layers(
+        const std::vector<layer_row> & rows, bool from_top, double mass) {
+    std::vector<int> out;
+    if (mass <= 0.0) {
+        return out; // 0.0 means "select nothing"
     }
 
-    compute_composite_scores(rows);
+    std::vector<const layer_row *> valid;
+    for (const auto & r : rows) {
+        if (r.score >= 0.0) {
+            valid.push_back(&r);
+        }
+    }
+    std::sort(valid.begin(), valid.end(), [from_top](const layer_row * a, const layer_row * b) {
+        return from_top ? (a->score > b->score) : (a->score < b->score);
+    });
+
+    double cum = 0.0;
+    for (const auto * r : valid) {
+        out.push_back(r->layer);
+        cum += r->softmax;
+        if (cum > mass) {
+            break;
+        }
+    }
+
+    std::sort(out.begin(), out.end()); // report in layer order
+    return out;
+}
+
+static void print_importance_layers(const std::vector<layer_row> & rows) {
+    const auto top_layers    = select_importance_layers(rows, true,  g_importance_mass_top);
+    const auto bottom_layers = select_importance_layers(rows, false, g_importance_mass_bottom);
+
+    auto print_list = [](const char * label, const std::vector<int> & layers) {
+        printf("  %-24s (%zu):", label, layers.size());
+        for (int l : layers) {
+            printf(" %d", l);
+        }
+        printf("\n");
+    };
+
+    printf("  importance mass: top = %.3f, bottom = %.3f\n",
+           g_importance_mass_top, g_importance_mass_bottom);
+    print_list("most_important_layers",  top_layers);
+    print_list("least_important_layers", bottom_layers);
+    printf("\n");
+}
+
+static void print_report(const cb_data_t & data, const report_data_t & rep) {
+    std::vector<layer_row> rows = rep.rows; // local copy -- we re-sort it below
 
     if (g_rank_metric == 2) {
         std::sort(rows.begin(), rows.end(), [](const layer_row & a, const layer_row & b) {
@@ -422,12 +517,15 @@ static void print_report(const cb_data_t & data) {
     }
 
     const layer_data_t empty;
-    for (int layer : empty_layers) {
+    for (int layer : rep.empty_layers) {
         emit("-", layer, empty, -1.0);
     }
 
     printf("\n\n");
+    print_importance_layers(rep.rows);
     fflush(stdout);
+
+    printf("\n\n");
 
     LOG_INF("%s: computed over %d tokens, %d layers\n", __func__, data.n_tokens, data.n_layer);
     LOG_INF("%s: total hidden state data captured: %.2f MiB\n", __func__, data.n_bytes/1024.0/1024.0);
@@ -441,13 +539,31 @@ static common_json_value stat_json(const running_stats_t & s, bool want_std) {
     return want_std ? s.stddev() : s.mean;
 }
 
-// write per-layer stats to a JSON file
-static bool write_json(const cb_data_t & state, const std::string & path) {
+// write per-layer stats (and importance layer selection) to a JSON file
+static bool write_json(const cb_data_t & state, const report_data_t & rep, const std::string & path) {
     if (path.empty()) {
         return true;
     }
 
     common_json root = common_json::object();
+
+    // importance mass options and derived layer selections
+    root["importance_mass_top"]    = g_importance_mass_top;
+    root["importance_mass_bottom"] = g_importance_mass_bottom;
+
+    const auto top_layers    = select_importance_layers(rep.rows, true,  g_importance_mass_top);
+    const auto bottom_layers = select_importance_layers(rep.rows, false, g_importance_mass_bottom);
+
+    root["most_important_layers"] = common_json::array();
+    for (int layer : top_layers) {
+        root["most_important_layers"].push_back(layer);
+    }
+
+    root["least_important_layers"] = common_json::array();
+    for (int layer : bottom_layers) {
+        root["least_important_layers"].push_back(layer);
+    }
+
     root["layers"] = common_json::array();
 
     const layer_data_t empty; // all running_stats_t have n == 0
@@ -546,11 +662,26 @@ static void print_usage(int /*argc*/, char ** /*argv*/) {
     printf("                         composite - combined cos_sim and l2_dist (default)\n");
     printf("                         cos_sim   - cosine similarity to previous layer\n");
     printf("                         l2_dist   - L2 distance to previous layer\n");
-    printf("  --output-json PATH   write per-layer stats to a JSON file\n\n");
+    printf("  --output-json PATH   write per-layer stats to a JSON file\n");
+    printf("  --importance-mass-top N     fraction of softmax importance mass to keep from the\n");
+    printf("                              most-important end, 0.0 - 0.5 (default: 0.1)\n");
+    printf("  --importance-mass-bottom N  fraction of softmax importance mass to keep from the\n");
+    printf("                              least-important end, 0.0 - 0.5 (default: 0.1)\n\n");
 }
 
-// pre-scan argv, extract custom flags (`--rank-by`, `--output-json`), and remove
-// them from argv so common_params_parse() doesn't reject them as unknown flags.
+static double parse_mass_value(const char * arg, const char * opt) {
+    char * end = nullptr;
+    const double v = std::strtod(arg, &end);
+    if (end == arg || *end != '\0' || !std::isfinite(v) || v < 0.0 || v > 0.5) {
+        fprintf(stderr, "error: %s must be a number between 0.0 and 0.5, got '%s'\n", opt, arg);
+        exit(1);
+    }
+    return v;
+}
+
+// pre-scan argv, extract custom flags (`--rank-by`, `--output-json`,
+// `--importance-mass-top`, `--importance-mass-bottom`), and remove them from
+// argv so common_params_parse() doesn't reject them as unknown flags.
 static void strip_custom_args(int & argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--rank-by") == 0) {
@@ -580,6 +711,28 @@ static void strip_custom_args(int & argc, char ** argv) {
                 exit(1);
             }
             g_output_path = argv[i + 1];
+            for (int j = i; j + 2 < argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            i--;
+        } else if (strcmp(argv[i], "--importance-mass-top") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --importance-mass-top requires an argument (0.0 - 0.5)\n");
+                exit(1);
+            }
+            g_importance_mass_top = parse_mass_value(argv[i + 1], "--importance-mass-top");
+            for (int j = i; j + 2 < argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            i--;
+        } else if (strcmp(argv[i], "--importance-mass-bottom") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --importance-mass-bottom requires an argument (0.0 - 0.5)\n");
+                exit(1);
+            }
+            g_importance_mass_bottom = parse_mass_value(argv[i + 1], "--importance-mass-bottom");
             for (int j = i; j + 2 < argc; ++j) {
                 argv[j] = argv[j + 2];
             }
@@ -642,9 +795,12 @@ int main(int argc, char ** argv) {
 
     run_layer_stats(ctx, params, cb_data);
 
-    print_report(cb_data);
+    // build the composite/softmax report once -- shared by console + JSON output
+    const report_data_t rep = build_report_data(cb_data);
 
-    if (!write_json(cb_data, g_output_path)) {
+    print_report(cb_data, rep);
+
+    if (!write_json(cb_data, rep, g_output_path)) {
         LOG_ERR("%s: failed to write JSON output\n", __func__);
         llama_backend_free();
         return 1;
